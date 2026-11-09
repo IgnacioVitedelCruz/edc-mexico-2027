@@ -1771,19 +1771,50 @@
         let synthInterval = null;
         let visualizerRaf = null;
         let itunesCache = {};
+        let itunesArtistPool = {};
         let ytIdCache = Object.assign({}, KNOWN_VIDEO_IDS);
         let spotifyIdCache = Object.assign({}, KNOWN_SPOTIFY_TRACKS);
         let activePlayRequestId = 0;
+        let isPrimingSilentAudio = false;
 
-        // Micro WAV silencioso en base64 para enganchar el canal de audio de iOS Safari síncronamente en CADA toque
-        const SILENT_AUDIO_URI = "data:audio/wav;base64,UklGRigAAABXQVZFZm10IBIAAAABAAEARKwAAIhYAQACABAAAABkYXRhAgAAAAEA";
+        // Genera un WAV silencioso de 1 segundo completo para que iOS Safari nunca cierre el canal de audio durante una descarga
+        const SILENT_AUDIO_URI = (function createOneSecondSilentWav() {
+            try {
+                const sampleRate = 8000;
+                const numSamples = sampleRate; // 1.0 segundo
+                const buffer = new ArrayBuffer(44 + numSamples * 2);
+                const view = new DataView(buffer);
+                const writeStr = (offset, str) => {
+                    for (let i = 0; i < str.length; i++) view.setUint8(offset + i, str.charCodeAt(i));
+                };
+                writeStr(0, "RIFF");
+                view.setUint32(4, 36 + numSamples * 2, true);
+                writeStr(8, "WAVE");
+                writeStr(12, "fmt ");
+                view.setUint32(16, 16, true);
+                view.setUint16(20, 1, true);
+                view.setUint16(22, 1, true);
+                view.setUint32(24, sampleRate, true);
+                view.setUint32(28, sampleRate * 2, true);
+                view.setUint16(32, 2, true);
+                view.setUint16(34, 16, true);
+                writeStr(36, "data");
+                view.setUint32(40, numSamples * 2, true);
+                const bytes = new Uint8Array(buffer);
+                let binary = "";
+                for (let i = 0; i < bytes.byteLength; i++) binary += String.fromCharCode(bytes[i]);
+                return "data:audio/wav;base64," + btoa(binary);
+            } catch (e) {
+                return "data:audio/wav;base64,UklGRigAAABXQVZFZm10IBIAAAABAAEARKwAAIhYAQACABAAAABkYXRhAgAAAAEA";
+            }
+        })();
 
         // Detect iPhone / iPad / iOS WebKit
         const IS_IOS = /iPad|iPhone|iPod/.test(navigator.userAgent) ||
                        (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
 
-        // CRITICAL FOR IPHONE: Run on EVERY tap so the 2nd, 3rd, and 100th song keep iOS user-gesture activation alive
-        function unlockIosMediaSync() {
+        // CRITICAL FOR IPHONE: Keeps the HTML5 <audio> element actively playing in loop during async fetch
+        function unlockIosMediaSync(alreadyHasDirectUrl) {
             try {
                 if (navigator.audioSession && navigator.audioSession.type !== "playback") {
                     navigator.audioSession.type = "playback";
@@ -1806,12 +1837,14 @@
                     audioEl.setAttribute("playsinline", "true");
                     audioEl.setAttribute("webkit-playsinline", "true");
                     audioEl.muted = false;
-                    // En iOS debemos iniciar una reproducción síncrona válida dentro del clic ANTES del await fetch()
-                    // para que cuando llegue la URL de la 2da o 3ra canción, Safari permita cambiar el src y sonar.
-                    audioEl.src = SILENT_AUDIO_URI;
-                    const p = audioEl.play();
-                    if (p && typeof p.catch === "function") {
-                        p.catch(() => {});
+                    if (!alreadyHasDirectUrl) {
+                        isPrimingSilentAudio = true;
+                        audioEl.loop = true;
+                        audioEl.src = SILENT_AUDIO_URI;
+                        const p = audioEl.play();
+                        if (p && typeof p.catch === "function") {
+                            p.catch(() => {});
+                        }
                     }
                 }
             } catch (e) {}
@@ -1901,19 +1934,39 @@
         }
 
         // Fetch real official audio stream & high-res album artwork from iTunes Search API (Fetch + JSONP fallback)
-        // Also picks distinct tracks based on track number so tracks 1..10 of an artist never play the exact same song!
-        async function fetchRealTrackStream(rawTitle, artistName, trackIndexHint) {
-            const cacheKey = rawTitle + "__" + artistName + "__" + (trackIndexHint || 0);
-            if (itunesCache[cacheKey]) {
-                return itunesCache[cacheKey];
-            }
+        // Also caches the artist's pool of tracks so subsequent songs of that artist play 100% synchronously on iPhone!
+        function getInstantCachedStream(rawTitle, artistName, trackIndexHint) {
+            const idx = typeof trackIndexHint === "number" ? trackIndexHint : 0;
+            const cacheKey = rawTitle + "__" + artistName + "__" + idx;
+            if (itunesCache[cacheKey]) return itunesCache[cacheKey];
 
+            const primaryArtist = artistName.split(/B2B|\+/i)[0].replace(/Presents.*$/i, "").trim().toLowerCase();
+            const pool = itunesArtistPool[primaryArtist];
+            if (pool && pool.length > 0) {
+                const lowerRaw = rawTitle.toLowerCase();
+                const exactHit = pool.find(r => r.trackName && lowerRaw.includes(r.trackName.toLowerCase()));
+                const picked = exactHit || pool[idx % pool.length];
+                if (picked) {
+                    itunesCache[cacheKey] = picked;
+                    return picked;
+                }
+            }
+            return null;
+        }
+
+        async function fetchRealTrackStream(rawTitle, artistName, trackIndexHint) {
+            const idx = typeof trackIndexHint === "number" ? trackIndexHint : 0;
+            const instant = getInstantCachedStream(rawTitle, artistName, idx);
+            if (instant) return instant;
+
+            const cacheKey = rawTitle + "__" + artistName + "__" + idx;
             const term = cleanSearchQuery(rawTitle, artistName);
             const primaryArtist = artistName.split(/B2B|\+/i)[0].replace(/Presents.*$/i, "").trim();
+            const poolKey = primaryArtist.toLowerCase();
 
             const urlsToTry = [
-                `https://itunes.apple.com/search?term=${encodeURIComponent(term)}&media=music&entity=song&limit=12`,
-                `https://itunes.apple.com/search?term=${encodeURIComponent(primaryArtist)}&media=music&entity=song&limit=15`
+                `https://itunes.apple.com/search?term=${encodeURIComponent(term)}&media=music&entity=song&limit=15`,
+                `https://itunes.apple.com/search?term=${encodeURIComponent(primaryArtist)}&media=music&entity=song&limit=20`
             ];
 
             for (let i = 0; i < urlsToTry.length; i++) {
@@ -1926,24 +1979,24 @@
                 }
 
                 if (data && data.results && data.results.length > 0) {
-                    const validHits = data.results.filter(r => r.previewUrl);
+                    const validHits = data.results.filter(r => r.previewUrl).map(hit => ({
+                        trackId: hit.trackId,
+                        previewUrl: hit.previewUrl,
+                        artworkUrl: hit.artworkUrl100 ? hit.artworkUrl100.replace("100x100bb", "600x600bb") : null,
+                        foundTrackName: `${hit.artistName} — ${hit.trackName}`,
+                        artistName: hit.artistName,
+                        trackName: hit.trackName
+                    }));
+
                     if (validHits.length > 0) {
-                        // Si buscamos por canción específica pero hay varios resultados, o si caímos al catálogo del artista,
-                        // seleccionamos usando trackIndexHint para que cada fila (01..10) reproduzca una pista distinta.
-                        const idxToPick = (typeof trackIndexHint === "number" && (i === 1 || rawTitle.includes("EDC Mexico") || rawTitle.includes("Club") || rawTitle.includes("Mix") || rawTitle.includes("Set") || rawTitle.includes("Edit")))
-                            ? (trackIndexHint % validHits.length)
-                            : 0;
-                        const hit = validHits[idxToPick] || validHits[0];
-                        const resultObj = {
-                            trackId: hit.trackId,
-                            previewUrl: hit.previewUrl,
-                            artworkUrl: hit.artworkUrl100 ? hit.artworkUrl100.replace("100x100bb", "600x600bb") : null,
-                            foundTrackName: `${hit.artistName} — ${hit.trackName}`,
-                            artistName: hit.artistName,
-                            trackName: hit.trackName
-                        };
-                        itunesCache[cacheKey] = resultObj;
-                        return resultObj;
+                        if (!itunesArtistPool[poolKey] || itunesArtistPool[poolKey].length < validHits.length) {
+                            itunesArtistPool[poolKey] = validHits;
+                        }
+                        const isGenericRow = i === 1 || rawTitle.includes("EDC Mexico") || rawTitle.includes("Club") || rawTitle.includes("Mix") || rawTitle.includes("Set") || rawTitle.includes("Edit");
+                        const idxToPick = isGenericRow ? (idx % validHits.length) : 0;
+                        const chosen = validHits[idxToPick] || validHits[0];
+                        itunesCache[cacheKey] = chosen;
+                        return chosen;
                     }
                 }
             }
@@ -2434,31 +2487,50 @@
             const audioEl = document.getElementById("globalHtml5Audio");
             stopRaveSynth();
 
+            const tIdx = typeof trackIdxHint === "number" ? trackIdxHint : 0;
             const cachedVid = ytIdCache[rawTitle] || null;
             const cachedSp = (spotifyIdCache[rawTitle] && !spotifyIdCache[rawTitle].includes("234234"))
                 ? spotifyIdCache[rawTitle]
                 : null;
+            const instantStream = getInstantCachedStream(rawTitle, artistObj.name, tIdx);
 
             currentMediaMeta = {
                 query: rawTitle,
                 artistName: artistObj.name,
                 genre: artistObj.genre || "",
                 stage: artistObj.stage,
-                trackIndex: typeof trackIdxHint === "number" ? trackIdxHint : 0,
+                trackIndex: tIdx,
                 status: "loading",
-                previewUrl: null,
-                artworkUrl: null,
-                foundTrackName: "",
+                previewUrl: instantStream ? instantStream.previewUrl : null,
+                artworkUrl: instantStream ? instantStream.artworkUrl : null,
+                foundTrackName: instantStream ? instantStream.foundTrackName : "",
                 spotifyTrackId: cachedSp,
                 resolvedVideoId: cachedVid,
                 resolvingVideo: (playerEngine === "video" && !cachedVid)
             };
 
+            // Si la pista ya está en caché y estamos en modo audio, se reproduce 100% síncrono en el mismo toque de iPhone
+            if (playerEngine === "audio" && instantStream && instantStream.previewUrl && audioEl) {
+                isPrimingSilentAudio = false;
+                audioEl.loop = false;
+                audioEl.src = instantStream.previewUrl;
+                currentMediaMeta.status = "playing-stream";
+                const syncPromise = audioEl.play();
+                if (syncPromise && typeof syncPromise.catch === "function") {
+                    syncPromise.catch(() => {
+                        currentMediaMeta.status = "paused";
+                        updatePlayerStageDomOnly();
+                    });
+                }
+                updatePlayerStageDomOnly();
+                return;
+            }
+
             updatePlayerStageDomOnly();
 
             // 1. AUDIO ENGINE: Plays immediately on iPhone & Android for EVERY track (1st, 2nd, 3rd...)
             if (playerEngine === "audio") {
-                const streamData = await fetchRealTrackStream(rawTitle, artistObj.name, currentMediaMeta.trackIndex);
+                const streamData = await fetchRealTrackStream(rawTitle, artistObj.name, tIdx);
                 if (reqId !== activePlayRequestId) return;
 
                 if (streamData && streamData.previewUrl && audioEl) {
@@ -2468,18 +2540,26 @@
                     currentMediaMeta.status = "playing-stream";
 
                     try {
+                        isPrimingSilentAudio = false;
+                        audioEl.loop = false;
+                        // IMPORTANTE: En iOS Safari NUNCA asignar audioEl.currentTime = 0 justo después de cambiar .src
+                        // porque lanza InvalidStateError cuando readyState === 0 y abortaba hacia el sintetizador.
                         audioEl.src = streamData.previewUrl;
-                        audioEl.currentTime = 0;
                         const playPromise = audioEl.play();
                         if (playPromise !== undefined) {
                             await playPromise;
                         }
                     } catch (playErr) {
-                        // Fallback to dynamic synth if network stream is blocked
-                        startRaveSynth(rawTitle, artistObj.genre);
-                        currentMediaMeta.status = "playing-synth";
+                        // Si iOS pausó por red lenta, NO reemplazamos la canción real por el sintetizador;
+                        // dejamos lista la canción real para que suene al tocar "▶ Reproducir" sin espera.
+                        currentMediaMeta.status = "paused";
                     }
                 } else {
+                    isPrimingSilentAudio = false;
+                    if (audioEl) {
+                        audioEl.loop = false;
+                        audioEl.pause();
+                    }
                     startRaveSynth(rawTitle, artistObj.genre);
                     currentMediaMeta.status = "playing-synth";
                 }
@@ -2489,11 +2569,13 @@
             }
 
             // 2. VIDEO OR SPOTIFY ENGINE: Resolve real YouTube Video ID & Spotify Track ID via iTunes + Odesli Cross-Platform API
+            isPrimingSilentAudio = false;
             if (audioEl) {
+                audioEl.loop = false;
                 audioEl.pause();
             }
 
-            const resolved = await resolveCrossPlatformIds(rawTitle, artistObj.name, currentMediaMeta.trackIndex);
+            const resolved = await resolveCrossPlatformIds(rawTitle, artistObj.name, tIdx);
             if (reqId !== activePlayRequestId) return;
 
             if (resolved.itunesData) {
@@ -2505,17 +2587,15 @@
             currentMediaMeta.spotifyTrackId = resolved.spotifyId;
             currentMediaMeta.resolvingVideo = false;
 
-            // If user is on iPhone and YouTube Video ID could not be resolved for an underground track,
-            // automatically switch to Audio Stream so it plays right away instead of showing a dead box
             if (playerEngine === "video" && !currentMediaMeta.resolvedVideoId && currentMediaMeta.previewUrl && audioEl) {
                 playerEngine = "audio";
                 currentMediaMeta.status = "playing-stream";
                 try {
+                    audioEl.loop = false;
                     audioEl.src = currentMediaMeta.previewUrl;
                     await audioEl.play();
                 } catch (e) {
-                    startRaveSynth(rawTitle, artistObj.genre);
-                    currentMediaMeta.status = "playing-synth";
+                    currentMediaMeta.status = "paused";
                 }
             }
 
@@ -2586,7 +2666,6 @@
         }
 
         function togglePlayPauseGlobal() {
-            unlockIosMediaSync();
             const audioEl = document.getElementById("globalHtml5Audio");
             if (currentMediaMeta.status === "playing-stream" && audioEl) {
                 audioEl.pause();
@@ -2596,9 +2675,15 @@
                 currentMediaMeta.status = "paused";
             } else {
                 if (currentMediaMeta.previewUrl && audioEl) {
+                    isPrimingSilentAudio = false;
+                    audioEl.loop = false;
+                    if (audioEl.src !== currentMediaMeta.previewUrl) {
+                        audioEl.src = currentMediaMeta.previewUrl;
+                    }
                     audioEl.play().catch(() => {});
                     currentMediaMeta.status = "playing-stream";
                 } else {
+                    unlockIosMediaSync(false);
                     startRaveSynth(currentMediaMeta.query, currentMediaMeta.genre);
                     currentMediaMeta.status = "playing-synth";
                 }
@@ -2609,7 +2694,7 @@
                 const btn = document.getElementById("playPauseBtn_" + cid);
                 const st = document.getElementById("stageStatusText_" + cid);
                 if (btn) btn.innerHTML = isPlaying ? "⏸ Pausar" : "▶ Reproducir";
-                if (st) st.textContent = isPlaying ? "🎧 Reproduciendo en Vivo" : "⏸ Reproducción en Pausa";
+                if (st) st.textContent = isPlaying ? "🎧 Reproduciendo Audio Oficial" : "⏸ Reproducción en Pausa";
             });
         }
 
@@ -2646,6 +2731,7 @@
             if (!audioEl) return;
 
             audioEl.addEventListener("timeupdate", () => {
+                if (isPrimingSilentAudio || (audioEl.src && audioEl.src.startsWith("data:audio/"))) return;
                 const pct = audioEl.duration ? (audioEl.currentTime / audioEl.duration) * 100 : 0;
                 ["inline", "dock"].forEach(cid => {
                     const slider = document.getElementById("seekSlider_" + cid);
@@ -2658,6 +2744,7 @@
             });
 
             audioEl.addEventListener("ended", () => {
+                if (isPrimingSilentAudio || (audioEl.src && audioEl.src.startsWith("data:audio/"))) return;
                 if (dockState.open) {
                     playAdjacentTrack(1);
                 } else {
@@ -2732,11 +2819,14 @@
 
         // Toggle inline player right below the selected song or live set
         function toggleInlineVideo(trackKey) {
-            unlockIosMediaSync();
             if (activeInlineTrackKey === trackKey) {
                 activeInlineTrackKey = null;
+                isPrimingSilentAudio = false;
                 const audioEl = document.getElementById("globalHtml5Audio");
-                if (audioEl) audioEl.pause();
+                if (audioEl) {
+                    audioEl.loop = false;
+                    audioEl.pause();
+                }
                 stopRaveSynth();
                 renderApp();
                 return;
@@ -2756,11 +2846,12 @@
                 ? (artistObj.name + " — Live Set EDC Festival")
                 : (artistObj.tracks[tIdx]?.title || artistObj.name);
 
-            // En iPhone (iOS), usamos por defecto el motor de Audio Directo ("audio") para garantizar que
-            // la canción 1, 2, 3... suene al primer toque sin que Safari bloquee el autoplay de iframes.
             if (IS_IOS && idxOrLive !== "liveset") {
                 playerEngine = "audio";
             }
+
+            const hasCached = !!getInstantCachedStream(rawTitle, artistObj.name, tIdx);
+            unlockIosMediaSync(hasCached);
 
             renderApp();
             loadAndPlayTrackMedia(rawTitle, artistObj, tIdx);
@@ -2768,7 +2859,6 @@
 
         // Open any track or Live Set in the persistent bottom-right Floating Player
         function openInDock(artistId, trackIdx, isLiveSet) {
-            unlockIosMediaSync();
             const aIdx = ARTISTS_DATA.findIndex(a => a.id === artistId);
             if (aIdx === -1) return;
 
@@ -2783,6 +2873,9 @@
             const rawTitle = dockState.isLiveSet
                 ? (artistObj.name + " — Full Live Set EDC")
                 : (artistObj.tracks[dockState.trackIndex]?.title || artistObj.name);
+
+            const hasCached = !!getInstantCachedStream(rawTitle, artistObj.name, dockState.trackIndex);
+            unlockIosMediaSync(hasCached);
 
             renderApp();
             renderDockPlayer();
@@ -2825,7 +2918,6 @@
         }
 
         function playAdjacentTrack(step) {
-            unlockIosMediaSync();
             const artist = ARTISTS_DATA[dockState.artistIndex] || ARTISTS_DATA[0];
             if (!artist) return;
             dockState.isLiveSet = false;
@@ -2842,6 +2934,9 @@
 
             const nextArtist = ARTISTS_DATA[dockState.artistIndex];
             const nextTitle = nextArtist.tracks[dockState.trackIndex].title;
+
+            const hasCached = !!getInstantCachedStream(nextTitle, nextArtist.name, dockState.trackIndex);
+            unlockIosMediaSync(hasCached);
 
             if (activeInlineTrackKey) {
                 activeInlineTrackKey = nextArtist.id + "__" + dockState.trackIndex;
@@ -3005,6 +3100,11 @@
                 expandedArtists.delete(artistId);
             } else {
                 expandedArtists.add(artistId);
+                // Precarga silenciosa del catálogo del artista en segundo plano al abrir su tarjeta
+                const artistObj = ARTISTS_DATA.find(a => a.id === artistId);
+                if (artistObj && artistObj.tracks[0]) {
+                    fetchRealTrackStream(artistObj.tracks[0].title, artistObj.name, 0).catch(() => {});
+                }
             }
             renderApp();
         }
