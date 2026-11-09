@@ -1772,14 +1772,17 @@
         let visualizerRaf = null;
         let itunesCache = {};
         let ytIdCache = Object.assign({}, KNOWN_VIDEO_IDS);
-        let iosAudioUnlocked = false;
+        let spotifyIdCache = Object.assign({}, KNOWN_SPOTIFY_TRACKS);
+        let activePlayRequestId = 0;
+
+        // Micro WAV silencioso en base64 para enganchar el canal de audio de iOS Safari síncronamente en CADA toque
+        const SILENT_AUDIO_URI = "data:audio/wav;base64,UklGRigAAABXQVZFZm10IBIAAAABAAEARKwAAIhYAQACABAAAABkYXRhAgAAAAEA";
 
         // Detect iPhone / iPad / iOS WebKit
         const IS_IOS = /iPad|iPhone|iPod/.test(navigator.userAgent) ||
                        (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
 
-        // CRITICAL FOR IPHONE: Synchronously unlock HTML5 <audio> and WebAudio inside the exact user tap event
-        // before any async fetch/Promise runs, and set iOS AudioSession to "playback" so it works even with the ringer switch on silent.
+        // CRITICAL FOR IPHONE: Run on EVERY tap so the 2nd, 3rd, and 100th song keep iOS user-gesture activation alive
         function unlockIosMediaSync() {
             try {
                 if (navigator.audioSession && navigator.audioSession.type !== "playback") {
@@ -1795,23 +1798,21 @@
                 if (audioCtx && audioCtx.state === "suspended") {
                     audioCtx.resume();
                 }
-                if (audioCtx && !iosAudioUnlocked) {
-                    const silentBuf = audioCtx.createBuffer(1, 1, 22050);
-                    const src = audioCtx.createBufferSource();
-                    src.buffer = silentBuf;
-                    src.connect(audioCtx.destination);
-                    if (src.start) src.start(0);
-                }
             } catch (e) {}
 
             try {
                 const audioEl = document.getElementById("globalHtml5Audio");
-                if (audioEl && !iosAudioUnlocked) {
+                if (audioEl) {
                     audioEl.setAttribute("playsinline", "true");
                     audioEl.setAttribute("webkit-playsinline", "true");
-                    // Load state synchronously inside tap gesture so subsequent async .play() is permitted by iOS WebKit
-                    audioEl.load();
-                    iosAudioUnlocked = true;
+                    audioEl.muted = false;
+                    // En iOS debemos iniciar una reproducción síncrona válida dentro del clic ANTES del await fetch()
+                    // para que cuando llegue la URL de la 2da o 3ra canción, Safari permita cambiar el src y sonar.
+                    audioEl.src = SILENT_AUDIO_URI;
+                    const p = audioEl.play();
+                    if (p && typeof p.catch === "function") {
+                        p.catch(() => {});
+                    }
                 }
             } catch (e) {}
         }
@@ -1927,15 +1928,19 @@
                 if (data && data.results && data.results.length > 0) {
                     const validHits = data.results.filter(r => r.previewUrl);
                     if (validHits.length > 0) {
-                        // Pick exact title match first, or rotate by trackIndexHint so every track on the card plays a DIFFERENT song
-                        const idxToPick = (typeof trackIndexHint === "number" && i === 1)
+                        // Si buscamos por canción específica pero hay varios resultados, o si caímos al catálogo del artista,
+                        // seleccionamos usando trackIndexHint para que cada fila (01..10) reproduzca una pista distinta.
+                        const idxToPick = (typeof trackIndexHint === "number" && (i === 1 || rawTitle.includes("EDC Mexico") || rawTitle.includes("Club") || rawTitle.includes("Mix") || rawTitle.includes("Set") || rawTitle.includes("Edit")))
                             ? (trackIndexHint % validHits.length)
                             : 0;
                         const hit = validHits[idxToPick] || validHits[0];
                         const resultObj = {
+                            trackId: hit.trackId,
                             previewUrl: hit.previewUrl,
                             artworkUrl: hit.artworkUrl100 ? hit.artworkUrl100.replace("100x100bb", "600x600bb") : null,
-                            foundTrackName: `${hit.artistName} — ${hit.trackName}`
+                            foundTrackName: `${hit.artistName} — ${hit.trackName}`,
+                            artistName: hit.artistName,
+                            trackName: hit.trackName
                         };
                         itunesCache[cacheKey] = resultObj;
                         return resultObj;
@@ -1943,6 +1948,57 @@
                 }
             }
             return null;
+        }
+
+        // Cross-platform resolver: takes an iTunes Track or Title and resolves BOTH real YouTube Video ID and real Spotify Track ID!
+        async function resolveCrossPlatformIds(rawTitle, artistName, trackIndexHint) {
+            if (ytIdCache[rawTitle] && spotifyIdCache[rawTitle] && !spotifyIdCache[rawTitle].includes("234234")) {
+                return {
+                    youtubeId: ytIdCache[rawTitle],
+                    spotifyId: spotifyIdCache[rawTitle]
+                };
+            }
+
+            // Step 1: Get exact song metadata & Apple Music trackId from iTunes (100% CORS-friendly on iOS & Android)
+            const itunesData = await fetchRealTrackStream(rawTitle, artistName, trackIndexHint);
+
+            // Step 2: Query Odesli/Songlink API using the Apple Music trackId to get official YouTube + Spotify IDs
+            if (itunesData && itunesData.trackId) {
+                try {
+                    const odesliUrl = `https://api.song.link/v1-alpha.1/links?id=${itunesData.trackId}&userCountry=MX&songIfSingle=true`;
+                    const res = await fetch(odesliUrl);
+                    if (res.ok) {
+                        const linkData = await res.json();
+                        const linksByPlatform = linkData.linksByPlatform || {};
+
+                        if (linksByPlatform.youtube && linksByPlatform.youtube.url) {
+                            const ytMatch = linksByPlatform.youtube.url.match(/[?&]v=([a-zA-Z0-9_-]{11})/);
+                            if (ytMatch && ytMatch[1]) {
+                                ytIdCache[rawTitle] = ytMatch[1];
+                            }
+                        }
+                        if (linksByPlatform.spotify && linksByPlatform.spotify.url) {
+                            const spMatch = linksByPlatform.spotify.url.match(/track\/([a-zA-Z0-9]+)/);
+                            if (spMatch && spMatch[1]) {
+                                spotifyIdCache[rawTitle] = spMatch[1];
+                            }
+                        }
+                    }
+                } catch (e) {}
+            }
+
+            // Step 3: If YouTube ID still not found, try Piped/Invidious search with the real found song title
+            if (!ytIdCache[rawTitle]) {
+                const searchTarget = (itunesData && itunesData.foundTrackName) ? itunesData.foundTrackName : rawTitle;
+                const vid = await resolveDynamicYouTubeId(searchTarget, artistName);
+                if (vid) ytIdCache[rawTitle] = vid;
+            }
+
+            return {
+                youtubeId: ytIdCache[rawTitle] || null,
+                spotifyId: (spotifyIdCache[rawTitle] && !spotifyIdCache[rawTitle].includes("234234")) ? spotifyIdCache[rawTitle] : null,
+                itunesData: itunesData
+            };
         }
 
         // Dynamically resolve the REAL full-length YouTube Video ID for ANY of the 1,520 tracks using public Piped/Invidious search APIs
@@ -2027,18 +2083,16 @@
                 }
 
                 if (directVid) {
-                    // On iOS Safari, standard www.youtube.com with playsinline=1 avoids ITP iframe blocking & fullscreen lock
-                    const autoParam = IS_IOS ? "0" : "1";
-                    const embedSrc = `https://www.youtube.com/embed/${directVid}?autoplay=${autoParam}&playsinline=1&rel=0&modestbranding=1`;
+                    const embedSrc = `https://www.youtube.com/embed/${directVid}?autoplay=1&playsinline=1&rel=0&modestbranding=1`;
                     return `
                         <div class="video-frame-wrap">
                             <iframe src="${embedSrc}" referrerpolicy="strict-origin-when-cross-origin" title="${safeTitleEsc}" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" playsinline webkit-playsinline allowfullscreen></iframe>
                         </div>
                         <div class="video-helper-bar">
-                            <span style="color:#00f5d4; font-weight:700;">✅ Video Completo Listo (${IS_IOS ? 'Toca ▶ en el video para iniciar en iPhone' : 'ID: ' + directVid})</span>
+                            <span style="color:#00f5d4; font-weight:700;">✅ Video Oficial Cargado (${currentMediaMeta.foundTrackName || title})</span>
                             <div style="display:flex; gap:6px; flex-wrap:wrap;">
-                                <button type="button" class="mini-chip-btn" style="border-color:#ffee00; color:#ffee00;" onclick="setPlayerEngine('audio')">🎧 Usar Audio iOS</button>
-                                <a href="${spUrl}" target="_blank" rel="noopener noreferrer" class="sp-btn">🟢 Abrir en Spotify</a>
+                                <button type="button" class="mini-chip-btn" style="border-color:#ffee00; color:#ffee00;" onclick="setPlayerEngine('audio')">🎧 Cambiar a Audio Directo</button>
+                                <button type="button" class="mini-chip-btn" style="border-color:#1ed760; color:#1ed760;" onclick="setPlayerEngine('spotify')">🟢 Spotify Embed</button>
                                 <a href="${ytUrl}" target="_blank" rel="noopener noreferrer" class="yt-btn">↗ App YouTube</a>
                             </div>
                         </div>
@@ -2071,30 +2125,30 @@
 
             // ENGINE 2: SPOTIFY INTEGRATION (Official Spotify Embed + Direct App/Web Launcher)
             if (playerEngine === "spotify") {
-                const spTrackId = KNOWN_SPOTIFY_TRACKS[title] && !KNOWN_SPOTIFY_TRACKS[title].includes("234234")
-                    ? KNOWN_SPOTIFY_TRACKS[title]
-                    : null;
+                const spTrackId = currentMediaMeta.spotifyTrackId ||
+                    ((spotifyIdCache[title] && !spotifyIdCache[title].includes("234234")) ? spotifyIdCache[title] : null);
 
                 const embedUrl = spTrackId
                     ? `https://open.spotify.com/embed/track/${spTrackId}?utm_source=generator&theme=0`
-                    : `https://open.spotify.com/embed/playlist/37i9dQZF1DX4dyzvuaRJ0n?utm_source=generator&theme=0`; // Official Spotify Electronic Mint Playlist + Direct Track Button
+                    : `https://open.spotify.com/embed/playlist/37i9dQZF1DX4dyzvuaRJ0n?utm_source=generator&theme=0`;
 
                 return `
                     <div style="background:#080810; border:1px solid rgba(29,185,84,0.5); border-radius:14px; padding:12px;">
                         <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px; margin-bottom:10px;">
                             <div>
-                                <span style="color:#1ed760; font-size:0.74rem; font-weight:800; text-transform:uppercase;">🟢 Conexión Oficial Spotify • EDC México 2027</span>
-                                <div style="font-weight:800; font-size:0.9rem; color:#ffffff;">${title}</div>
+                                <span style="color:#1ed760; font-size:0.74rem; font-weight:800; text-transform:uppercase;">🟢 Reproductor Oficial Spotify • ${spTrackId ? 'Canción Exacta Vinculada' : 'Playlist Electrónica + Búsqueda Directa'}</span>
+                                <div style="font-weight:800; font-size:0.9rem; color:#ffffff;">${currentMediaMeta.foundTrackName || title}</div>
                             </div>
                             <a href="${spUrl}" target="_blank" rel="noopener noreferrer" class="sp-btn" style="padding:7px 14px; font-size:0.8rem;">
-                                🟢 Escuchar "${artistName}" Completo en Spotify ↗
+                                🟢 Abrir en App Spotify ↗
                             </a>
                         </div>
-                        <iframe style="border-radius:12px" src="${embedUrl}" width="100%" height="152" frameBorder="0" allowfullscreen="" allow="autoplay; clipboard-write; encrypted-media; fullscreen; picture-in-picture" loading="lazy"></iframe>
+                        <iframe style="border-radius:12px" src="${embedUrl}" width="100%" height="152" frameBorder="0" allowfullscreen="" allow="autoplay; clipboard-write; encrypted-media; fullscreen; picture-in-picture" playsinline webkit-playsinline></iframe>
                     </div>
                 `;
             }
 
+            // ENGINE 3: NATIVE AUDIO STREAM + INTERACTIVE CONTROLLER (Fixed CORS + iOS Multi-Track Unlock)
             // ENGINE 3: NATIVE AUDIO STREAM + INTERACTIVE CONTROLLER (Fixed CORS + Unique Synth per Track)
             const initials = artistName.slice(0, 2).toUpperCase();
             const artHtml = currentMediaMeta.artworkUrl
@@ -2349,95 +2403,95 @@
                                     ${isExpanded ? '▲ Ocultar Top 10 Canciones' : '▼ Ver Top 10 Canciones (10 Tracks)'}
                                 </button>
                                 <div style="display:flex; gap:6px; flex-wrap:wrap;">
-                                    <button type="button" class="liveset-link" style="cursor:pointer;" onclick="toggleInlineVideo('${liveSetInlineKey}')">
-                                        ${isLiveSetInlineOpen ? '▲ Ocultar Live Set' : '▶ Ver Live Set Aquí'}
-                                    </button>
-                                    <a href="${artistSpotifyUrl}" target="_blank" rel="noopener noreferrer" class="sp-btn">
-                                        🟢 Spotify
-                                    </a>
-                                    <a href="${liveSetUrl}" target="_blank" rel="noopener noreferrer" class="yt-btn">
-                                        ↗ Set en YT
-                                    </a>
-                                </div>
-                            </div>
-                        </div>
-                        ${liveSetInlineHtml}
-                        <div class="tracks-list ${isExpanded ? '' : 'collapsed'}">
-                            ${tracksHtml}
-                        </div>
-                    </article>
-                `;
-            }
-
-            grid.innerHTML = html;
-            updateBadges();
-            startLaserVisualizerLoop();
-        }
-
-        // Core Media Controller: Resolves Full YouTube Video ID, Spotify Embed, or Real Track Stream without destroying the DOM
+        // Core Media Controller: Resolves Full YouTube Video ID, Spotify Embed, or Real Track Stream without losing iOS Audio Gesture
         async function loadAndPlayTrackMedia(rawTitle, artistObj, trackIdxHint) {
+            const reqId = ++activePlayRequestId;
             const audioEl = document.getElementById("globalHtml5Audio");
             stopRaveSynth();
-            if (audioEl) {
-                audioEl.pause();
-                audioEl.currentTime = 0;
-            }
 
             const cachedVid = ytIdCache[rawTitle] || null;
+            const cachedSp = (spotifyIdCache[rawTitle] && !spotifyIdCache[rawTitle].includes("234234"))
+                ? spotifyIdCache[rawTitle]
+                : null;
 
             currentMediaMeta = {
                 query: rawTitle,
                 artistName: artistObj.name,
                 genre: artistObj.genre || "",
                 stage: artistObj.stage,
-                trackIndex: trackIdxHint || 0,
+                trackIndex: typeof trackIdxHint === "number" ? trackIdxHint : 0,
                 status: "loading",
                 previewUrl: null,
                 artworkUrl: null,
                 foundTrackName: "",
+                spotifyTrackId: cachedSp,
                 resolvedVideoId: cachedVid,
-                resolvingVideo: !cachedVid
+                resolvingVideo: (playerEngine === "video" && !cachedVid)
             };
 
             updatePlayerStageDomOnly();
 
-            // 1. If in Full YouTube Video mode, dynamically resolve the exact video ID if not already cached
-            if (playerEngine === "video") {
-                if (!cachedVid) {
-                    const resolved = await resolveDynamicYouTubeId(rawTitle, artistObj.name);
-                    if (currentMediaMeta.query !== rawTitle) return;
-                    currentMediaMeta.resolvedVideoId = resolved;
-                    currentMediaMeta.resolvingVideo = false;
-                    updatePlayerStageDomOnly();
-                }
-                return;
-            }
+            // 1. AUDIO ENGINE: Plays immediately on iPhone & Android for EVERY track (1st, 2nd, 3rd...)
+            if (playerEngine === "audio") {
+                const streamData = await fetchRealTrackStream(rawTitle, artistObj.name, currentMediaMeta.trackIndex);
+                if (reqId !== activePlayRequestId) return;
 
-            // 2. If in Spotify mode, nothing else needed (iframe loads directly)
-            if (playerEngine === "spotify") {
-                return;
-            }
+                if (streamData && streamData.previewUrl && audioEl) {
+                    currentMediaMeta.previewUrl = streamData.previewUrl;
+                    currentMediaMeta.artworkUrl = streamData.artworkUrl;
+                    currentMediaMeta.foundTrackName = streamData.foundTrackName;
+                    currentMediaMeta.status = "playing-stream";
 
-            // 3. If in Audio Stream + Laser mode, fetch real song stream from iTunes API (with JSONP fallback & CORS fix)
-            const streamData = await fetchRealTrackStream(rawTitle, artistObj.name, trackIdxHint);
-            if (currentMediaMeta.query !== rawTitle) return;
-
-            if (streamData && streamData.previewUrl && audioEl) {
-                currentMediaMeta.previewUrl = streamData.previewUrl;
-                currentMediaMeta.artworkUrl = streamData.artworkUrl;
-                currentMediaMeta.foundTrackName = streamData.foundTrackName;
-                currentMediaMeta.status = "playing-stream";
-
-                audioEl.src = streamData.previewUrl;
-                try {
-                    await audioEl.play();
-                } catch (playErr) {
+                    try {
+                        audioEl.src = streamData.previewUrl;
+                        audioEl.currentTime = 0;
+                        const playPromise = audioEl.play();
+                        if (playPromise !== undefined) {
+                            await playPromise;
+                        }
+                    } catch (playErr) {
+                        // Fallback to dynamic synth if network stream is blocked
+                        startRaveSynth(rawTitle, artistObj.genre);
+                        currentMediaMeta.status = "playing-synth";
+                    }
+                } else {
                     startRaveSynth(rawTitle, artistObj.genre);
                     currentMediaMeta.status = "playing-synth";
                 }
-            } else {
-                startRaveSynth(rawTitle, artistObj.genre);
-                currentMediaMeta.status = "playing-synth";
+
+                updatePlayerStageDomOnly();
+                return;
+            }
+
+            // 2. VIDEO OR SPOTIFY ENGINE: Resolve real YouTube Video ID & Spotify Track ID via iTunes + Odesli Cross-Platform API
+            if (audioEl) {
+                audioEl.pause();
+            }
+
+            const resolved = await resolveCrossPlatformIds(rawTitle, artistObj.name, currentMediaMeta.trackIndex);
+            if (reqId !== activePlayRequestId) return;
+
+            if (resolved.itunesData) {
+                currentMediaMeta.previewUrl = resolved.itunesData.previewUrl;
+                currentMediaMeta.artworkUrl = resolved.itunesData.artworkUrl;
+                currentMediaMeta.foundTrackName = resolved.itunesData.foundTrackName;
+            }
+            currentMediaMeta.resolvedVideoId = resolved.youtubeId;
+            currentMediaMeta.spotifyTrackId = resolved.spotifyId;
+            currentMediaMeta.resolvingVideo = false;
+
+            // If user is on iPhone and YouTube Video ID could not be resolved for an underground track,
+            // automatically switch to Audio Stream so it plays right away instead of showing a dead box
+            if (playerEngine === "video" && !currentMediaMeta.resolvedVideoId && currentMediaMeta.previewUrl && audioEl) {
+                playerEngine = "audio";
+                currentMediaMeta.status = "playing-stream";
+                try {
+                    audioEl.src = currentMediaMeta.previewUrl;
+                    await audioEl.play();
+                } catch (e) {
+                    startRaveSynth(rawTitle, artistObj.genre);
+                    currentMediaMeta.status = "playing-synth";
+                }
             }
 
             updatePlayerStageDomOnly();
@@ -2677,9 +2731,9 @@
                 ? (artistObj.name + " — Live Set EDC Festival")
                 : (artistObj.tracks[tIdx]?.title || artistObj.name);
 
-            // On iPhone, if the track doesn't have an instant pre-cached YouTube ID, default to "audio" mode first
-            // so the user hears music immediately without iOS blocking an async iframe!
-            if (IS_IOS && !ytIdCache[rawTitle] && playerEngine === "video") {
+            // En iPhone (iOS), usamos por defecto el motor de Audio Directo ("audio") para garantizar que
+            // la canción 1, 2, 3... suene al primer toque sin que Safari bloquee el autoplay de iframes.
+            if (IS_IOS && idxOrLive !== "liveset") {
                 playerEngine = "audio";
             }
 
