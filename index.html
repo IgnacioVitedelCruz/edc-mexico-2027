@@ -2403,6 +2403,31 @@
                                     ${isExpanded ? '▲ Ocultar Top 10 Canciones' : '▼ Ver Top 10 Canciones (10 Tracks)'}
                                 </button>
                                 <div style="display:flex; gap:6px; flex-wrap:wrap;">
+                                    <button type="button" class="liveset-link" style="cursor:pointer;" onclick="toggleInlineVideo('${liveSetInlineKey}')">
+                                        ${isLiveSetInlineOpen ? '▲ Ocultar Live Set' : '🎥 Ver Live Set Aquí'}
+                                    </button>
+                                    <a href="${artistSpotifyUrl}" target="_blank" rel="noopener noreferrer" class="sp-btn">
+                                        🟢 Spotify
+                                    </a>
+                                    <a href="${liveSetUrl}" target="_blank" rel="noopener noreferrer" class="liveset-link">
+                                        ↗ Set en YT
+                                    </a>
+                                </div>
+                            </div>
+                        </div>
+                        ${liveSetInlineHtml}
+                        <div class="tracks-list ${isExpanded ? '' : 'collapsed'}">
+                            ${tracksHtml}
+                        </div>
+                    </article>
+                `;
+            }
+
+            grid.innerHTML = html;
+            updateBadges();
+            startLaserVisualizerLoop();
+        }
+
         // Core Media Controller: Resolves Full YouTube Video ID, Spotify Embed, or Real Track Stream without losing iOS Audio Gesture
         async function loadAndPlayTrackMedia(rawTitle, artistObj, trackIdxHint) {
             const reqId = ++activePlayRequestId;
