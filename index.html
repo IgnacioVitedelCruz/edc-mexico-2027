@@ -1295,8 +1295,8 @@
         </div>
     </aside>
 
-    <!-- Elemento de Audio HTML5 Global (SIN crossorigin para evitar bloqueo CORS en streams de Apple/iTunes) -->
-    <audio id="globalHtml5Audio" preload="auto" style="display:none;"></audio>
+    <!-- Elemento de Audio HTML5 Global compatible con iOS Safari (playsinline + webkit-playsinline) -->
+    <audio id="globalHtml5Audio" preload="auto" playsinline webkit-playsinline style="display:none;"></audio>
 
     <!-- Modal Mi Ruta & Setlist -->
     <div id="summaryModal" class="modal-backdrop no-print" onclick="if(event.target===this) closeModal()">
@@ -1772,6 +1772,49 @@
         let visualizerRaf = null;
         let itunesCache = {};
         let ytIdCache = Object.assign({}, KNOWN_VIDEO_IDS);
+        let iosAudioUnlocked = false;
+
+        // Detect iPhone / iPad / iOS WebKit
+        const IS_IOS = /iPad|iPhone|iPod/.test(navigator.userAgent) ||
+                       (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+
+        // CRITICAL FOR IPHONE: Synchronously unlock HTML5 <audio> and WebAudio inside the exact user tap event
+        // before any async fetch/Promise runs, and set iOS AudioSession to "playback" so it works even with the ringer switch on silent.
+        function unlockIosMediaSync() {
+            try {
+                if (navigator.audioSession && navigator.audioSession.type !== "playback") {
+                    navigator.audioSession.type = "playback";
+                }
+            } catch (e) {}
+
+            try {
+                const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+                if (!audioCtx && AudioContextClass) {
+                    audioCtx = new AudioContextClass();
+                }
+                if (audioCtx && audioCtx.state === "suspended") {
+                    audioCtx.resume();
+                }
+                if (audioCtx && !iosAudioUnlocked) {
+                    const silentBuf = audioCtx.createBuffer(1, 1, 22050);
+                    const src = audioCtx.createBufferSource();
+                    src.buffer = silentBuf;
+                    src.connect(audioCtx.destination);
+                    if (src.start) src.start(0);
+                }
+            } catch (e) {}
+
+            try {
+                const audioEl = document.getElementById("globalHtml5Audio");
+                if (audioEl && !iosAudioUnlocked) {
+                    audioEl.setAttribute("playsinline", "true");
+                    audioEl.setAttribute("webkit-playsinline", "true");
+                    // Load state synchronously inside tap gesture so subsequent async .play() is permitted by iOS WebKit
+                    audioEl.load();
+                    iosAudioUnlocked = true;
+                }
+            } catch (e) {}
+        }
 
         function getYouTubeLink(queryText) {
             const vid = ytIdCache[queryText];
@@ -1984,17 +2027,19 @@
                 }
 
                 if (directVid) {
-                    const embedSrc = `https://www.youtube-nocookie.com/embed/${directVid}?autoplay=1&rel=0&modestbranding=1`;
+                    // On iOS Safari, standard www.youtube.com with playsinline=1 avoids ITP iframe blocking & fullscreen lock
+                    const autoParam = IS_IOS ? "0" : "1";
+                    const embedSrc = `https://www.youtube.com/embed/${directVid}?autoplay=${autoParam}&playsinline=1&rel=0&modestbranding=1`;
                     return `
                         <div class="video-frame-wrap">
-                            <iframe src="${embedSrc}" referrerpolicy="origin" title="${safeTitleEsc}" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" allowfullscreen></iframe>
+                            <iframe src="${embedSrc}" referrerpolicy="strict-origin-when-cross-origin" title="${safeTitleEsc}" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" playsinline webkit-playsinline allowfullscreen></iframe>
                         </div>
                         <div class="video-helper-bar">
-                            <span style="color:#00f5d4; font-weight:700;">✅ Reproduciendo Video Completo en Página (ID: ${directVid})</span>
+                            <span style="color:#00f5d4; font-weight:700;">✅ Video Completo Listo (${IS_IOS ? 'Toca ▶ en el video para iniciar en iPhone' : 'ID: ' + directVid})</span>
                             <div style="display:flex; gap:6px; flex-wrap:wrap;">
+                                <button type="button" class="mini-chip-btn" style="border-color:#ffee00; color:#ffee00;" onclick="setPlayerEngine('audio')">🎧 Usar Audio iOS</button>
                                 <a href="${spUrl}" target="_blank" rel="noopener noreferrer" class="sp-btn">🟢 Abrir en Spotify</a>
-                                <button type="button" class="mini-chip-btn" onclick="openYouTubePopup('${safeTitleEsc}')">🚀 Mini-TV Flotante</button>
-                                <a href="${ytUrl}" target="_blank" rel="noopener noreferrer" class="yt-btn">↗ YouTube</a>
+                                <a href="${ytUrl}" target="_blank" rel="noopener noreferrer" class="yt-btn">↗ App YouTube</a>
                             </div>
                         </div>
                     `;
@@ -2422,6 +2467,7 @@
         }
 
         function setPlayerEngine(engine) {
+            unlockIosMediaSync();
             playerEngine = engine;
             const audioEl = document.getElementById("globalHtml5Audio");
             if (engine !== "audio") {
@@ -2461,6 +2507,7 @@
         }
 
         function togglePlayPauseGlobal() {
+            unlockIosMediaSync();
             const audioEl = document.getElementById("globalHtml5Audio");
             if (currentMediaMeta.status === "playing-stream" && audioEl) {
                 audioEl.pause();
@@ -2606,6 +2653,7 @@
 
         // Toggle inline player right below the selected song or live set
         function toggleInlineVideo(trackKey) {
+            unlockIosMediaSync();
             if (activeInlineTrackKey === trackKey) {
                 activeInlineTrackKey = null;
                 const audioEl = document.getElementById("globalHtml5Audio");
@@ -2629,12 +2677,19 @@
                 ? (artistObj.name + " — Live Set EDC Festival")
                 : (artistObj.tracks[tIdx]?.title || artistObj.name);
 
+            // On iPhone, if the track doesn't have an instant pre-cached YouTube ID, default to "audio" mode first
+            // so the user hears music immediately without iOS blocking an async iframe!
+            if (IS_IOS && !ytIdCache[rawTitle] && playerEngine === "video") {
+                playerEngine = "audio";
+            }
+
             renderApp();
             loadAndPlayTrackMedia(rawTitle, artistObj, tIdx);
         }
 
         // Open any track or Live Set in the persistent bottom-right Floating Player
         function openInDock(artistId, trackIdx, isLiveSet) {
+            unlockIosMediaSync();
             const aIdx = ARTISTS_DATA.findIndex(a => a.id === artistId);
             if (aIdx === -1) return;
 
@@ -2691,6 +2746,7 @@
         }
 
         function playAdjacentTrack(step) {
+            unlockIosMediaSync();
             const artist = ARTISTS_DATA[dockState.artistIndex] || ARTISTS_DATA[0];
             if (!artist) return;
             dockState.isLiveSet = false;
