@@ -1398,7 +1398,7 @@
 
         // 1. Curated iconic tracks for major & mid-tier acts across the poster
         const SPECIFIC_TRACKS = {
-            "AARON HIBELL": ["Aaron Hibell — 孤 (Bipolar)", "Aaron Hibell — destroyer of worlds", "Aaron Hibell — ghost", "Aaron Hibell — sos", "Aaron Hibell — cherry", "Aaron Hibell — feeling", "Aaron Hibell & Alex Wann — set me free", "Aaron Hibell — I Feel Lost", "Aaron Hibell — odyssey", "Aaron Hibell — astral projection"],
+            "AARON HIBELL": ["Aaron Hibell — destroyer of worlds", "Aaron Hibell — i feel lost", "Aaron Hibell — ghost", "Aaron Hibell — s.o.s.", "Aaron Hibell — cherry", "Aaron Hibell — feeling", "Aaron Hibell & Alex Wann — set me free", "Aaron Hibell — odyssey", "Aaron Hibell — astral projection", "Aaron Hibell — nocturnal"],
             "ADRIATIQUE": ["Adriatique & Marino Canal — Home", "Adriatique & RÜFÜS DU SOL — Miracle (Remix)", "Adriatique — Mystery", "Adriatique — Ray", "Adriatique & WhoMadeWho — Miracle", "Adriatique — Hound", "Adriatique — Craft", "Swedish House Mafia — Moth To A Flame (Adriatique Remix)", "Adriatique & Eynka — Beyond Us", "Adriatique — Lognes"],
             "ALPHA 9": ["ALPHA 9 — Skin", "ALPHA 9 — All That I Can", "ALPHA 9 — Before The Dawn", "ALPHA 9 & Spencer Brown — Ariel", "ALPHA 9 — Come Home", "ALPHA 9 — Higher Place", "ALPHA 9 — Stellar", "ALPHA 9 & Kameron Alexander — Down To Love", "ALPHA 9 — Blossom", "ALPHA 9 — Everywhere I Go"],
             "APASHE": ["Apashe — Lacrimosa", "Apashe ft. Instasamka — Uebok (Gotta Run)", "Apashe ft. Geoffroy — Distance", "Apashe ft. Vo Williams — Majesty", "Apashe & YMIR — Never Change", "Apashe ft. Wasiu — Human", "Apashe — Dies Irae", "Apashe — Good News", "Apashe — Lord & Master", "Apashe & Flux Pavilion — Fracture"],
@@ -1901,10 +1901,54 @@
             const parts = rawTitle.split("—");
             const songRaw = parts.length > 1 ? parts.slice(1).join(" ") : rawTitle.replace(new RegExp(artistName, "ig"), "");
             return songRaw
-                .replace(/\(.*?\)/g, " ")
+                .replace(/\b(VIP|Festival Edit|Club Mix|Deluxe Mix|Official Video|Official Audio|Rework|Bootleg|Extended Mix)\b/gi, " ")
+                .replace(/[()[\]]/g, " ")
                 .replace(/EDC Mexico Festival Anthem Mix|Most Played Club Track|Boiler Room & Festival Live Cut|Exclusive VIP Edit & Remix|Peak Time Set Highlight|Unreleased ID & Bootleg Mix|Official Music Video \/ Top Hit|Extended Club Mix|Closing Track & Encore|Full Live DJ Set|Live Set EDC Festival/gi, "")
                 .replace(/\s+/g, " ")
                 .trim();
+        }
+
+        function isGenericPlaceholderTrack(rawTitle) {
+            return /EDC Mexico Festival Anthem Mix|Most Played Club Track|Boiler Room & Festival Live Cut|Exclusive VIP Edit & Remix|Peak Time Set Highlight|Unreleased ID & Bootleg Mix|Official Music Video \/ Top Hit|Extended Club Mix|Closing Track & Encore|Full Live DJ Set|Live Set EDC Festival/i.test(rawTitle);
+        }
+
+        function normalizeComparableText(str) {
+            return (str || "")
+                .toLowerCase()
+                .normalize("NFD")
+                .replace(/[\u0300-\u036f]/g, "")
+                .replace(/[$]/g, "s")
+                .replace(/[^a-z0-9\u3000-\u9fff]+/g, " ")
+                .replace(/\s+/g, " ")
+                .trim();
+        }
+
+        // Checks if a candidate track from Apple Music / Deezer genuinely matches the requested song title
+        function isStrictSongMatch(candidate, rawTitle, artistName) {
+            if (!candidate || !candidate.trackName) return false;
+            const songPartRaw = extractSongTitlePart(rawTitle, artistName);
+            if (!songPartRaw) return false;
+
+            const normSong = normalizeComparableText(songPartRaw);
+            const normCand = normalizeComparableText(candidate.trackName);
+            if (!normSong || !normCand) return false;
+
+            // Exact or substring match on normalized titles (e.g. "s.o.s." === "s o s" or "sos")
+            const compactSong = normSong.replace(/\s+/g, "");
+            const compactCand = normCand.replace(/\s+/g, "");
+            if (compactCand.includes(compactSong) || compactSong.includes(compactCand)) {
+                return true;
+            }
+
+            // All significant words of the requested song title must appear in the candidate trackName
+            const stopWords = new Set(["the", "and", "for", "with", "from", "mix", "edit", "vip", "club", "version", "remix", "feat", "ft"]);
+            const keywords = normSong
+                .split(" ")
+                .map(w => w.trim())
+                .filter(w => (w.length >= 2 && !stopWords.has(w)) || /[^\x00-\x7F]/.test(w));
+
+            if (keywords.length === 0) return false;
+            return keywords.every(kw => normCand.includes(kw) || compactCand.includes(kw));
         }
 
         // JSONP helper for iTunes & Deezer APIs (100% immune to iOS Safari / WhatsApp WKWebView CORS blocks)
@@ -1939,8 +1983,11 @@
         }
 
         // Fetch from Deezer JSONP API (Provides real 30s MP3 streams & HD covers with zero CORS blocks on iPhone)
-        async function fetchDeezerTracks(query) {
-            const url = `https://api.deezer.com/search?q=${encodeURIComponent(query)}&output=jsonp&limit=25`;
+        async function fetchDeezerTracks(query, strictArtist, strictTrack) {
+            const searchQ = (strictArtist && strictTrack)
+                ? `artist:"${strictArtist}" track:"${strictTrack}"`
+                : query;
+            const url = `https://api.deezer.com/search?q=${encodeURIComponent(searchQ)}&output=jsonp&limit=25`;
             const data = await fetchJsonpGeneric(url, "callback", 4000);
             if (!data || !Array.isArray(data.data)) return [];
             return data.data.filter(item => item && item.preview).map(item => ({
@@ -1954,8 +2001,9 @@
         }
 
         // Fetch from iTunes API using simultaneous Fetch + JSONP fallback
-        async function fetchItunesTracks(query, limit = 25) {
-            const baseUrl = `https://itunes.apple.com/search?term=${encodeURIComponent(query)}&media=music&entity=song&limit=${limit}`;
+        async function fetchItunesTracks(query, limit = 25, attribute = "") {
+            const attrParam = attribute ? `&attribute=${encodeURIComponent(attribute)}` : "";
+            const baseUrl = `https://itunes.apple.com/search?term=${encodeURIComponent(query)}&media=music&entity=song${attrParam}&limit=${limit}`;
             let data = null;
             if (!IS_IOS) {
                 try {
@@ -1978,10 +2026,9 @@
         }
 
         // Match the best track from a pool of real songs for a specific title & index
-        function pickBestTrackFromPool(pool, rawTitle, artistName, trackIndexHint) {
+        function pickBestTrackFromPool(pool, rawTitle, artistName, trackIndexHint, requireExactSongMatch = false) {
             if (!pool || pool.length === 0) return null;
             const idx = typeof trackIndexHint === "number" ? trackIndexHint : 0;
-            const songPart = extractSongTitlePart(rawTitle, artistName).toLowerCase();
             const primaryArtist = artistName.split(/B2B|\+/i)[0].replace(/Presents.*$/i, "").trim().toLowerCase();
 
             // Prefer tracks where artist name matches the DJ
@@ -1994,30 +2041,23 @@
             );
             const candidates = artistFiltered.length > 0 ? artistFiltered : pool;
 
-            // 1. Try matching the specific song name
-            if (songPart && songPart.length >= 2) {
-                const exact = candidates.find(r => {
-                    const t = (r.trackName || "").toLowerCase();
-                    return t && (t.includes(songPart) || songPart.includes(t));
-                });
-                if (exact) return exact;
+            // 1. Try matching the specific song name first across artist-filtered candidates, then full pool
+            const strictArtistHit = candidates.find(r => isStrictSongMatch(r, rawTitle, artistName));
+            if (strictArtistHit) return strictArtistHit;
 
-                // Try matching individual keywords of the song title
-                const words = songPart.split(/\s+/).filter(w => w.length >= 3);
-                if (words.length > 0) {
-                    const wordHit = candidates.find(r => {
-                        const t = (r.trackName || "").toLowerCase();
-                        return words.some(w => t.includes(w));
-                    });
-                    if (wordHit) return wordHit;
-                }
+            const strictAnyHit = pool.find(r => isStrictSongMatch(r, rawTitle, artistName));
+            if (strictAnyHit) return strictAnyHit;
+
+            // If caller requires an exact song title match (e.g., before firing a specific song query), return null so we fetch the exact song!
+            if (requireExactSongMatch && !isGenericPlaceholderTrack(rawTitle)) {
+                return null;
             }
 
-            // 2. Otherwise pick a distinct real track by this artist based on track index (0..9)
+            // 2. Fallback only when the track is a generic festival placeholder or after specific search completed
             return candidates[idx % candidates.length] || pool[idx % pool.length];
         }
 
-        // Instant synchronous lookup (Only returns if we have an exact cached hit or a full artist catalog >= 4 tracks)
+        // Instant synchronous lookup (Only returns if we have an exact cached hit or a verified title match)
         function getInstantCachedStream(rawTitle, artistName, trackIndexHint) {
             const idx = typeof trackIndexHint === "number" ? trackIndexHint : 0;
             const cacheKey = rawTitle + "__" + artistName + "__" + idx;
@@ -2025,8 +2065,9 @@
 
             const primaryArtist = artistName.split(/B2B|\+/i)[0].replace(/Presents.*$/i, "").trim().toLowerCase();
             const pool = itunesArtistPool[primaryArtist];
-            if (pool && pool.length >= 4) {
-                const picked = pickBestTrackFromPool(pool, rawTitle, artistName, idx);
+            if (pool && pool.length > 0) {
+                // Require strict song match for named tracks so "Bipolar" NEVER grabs "destroyer of worlds" from the pool!
+                const picked = pickBestTrackFromPool(pool, rawTitle, artistName, idx, true);
                 if (picked) {
                     itunesCache[cacheKey] = picked;
                     return picked;
@@ -2084,15 +2125,38 @@
             const songPart = extractSongTitlePart(rawTitle, artistName);
             const specificQuery = songPart ? `${primaryArtist} ${songPart}` : cleanSearchQuery(rawTitle, artistName);
 
-            // Fetch both the full artist catalog AND the specific song simultaneously across iTunes + Deezer
-            const [artistPool, specificItunes, specificDeezer] = await Promise.all([
-                ensureArtistCatalogPool(artistName),
-                songPart ? fetchItunesTracks(specificQuery, 8) : Promise.resolve([]),
-                songPart ? fetchDeezerTracks(specificQuery) : Promise.resolve([])
-            ]);
+            // 1. First check if the already-loaded artist catalog pool has the exact song match
+            const existingPool = itunesArtistPool[primaryArtist.toLowerCase()];
+            if (existingPool && existingPool.length > 0 && songPart && !isGenericPlaceholderTrack(rawTitle)) {
+                const poolExact = pickBestTrackFromPool(existingPool, rawTitle, artistName, idx, true);
+                if (poolExact) {
+                    itunesCache[cacheKey] = poolExact;
+                    return poolExact;
+                }
+            }
 
-            const combined = [...specificItunes, ...specificDeezer, ...(artistPool || [])];
-            const chosen = pickBestTrackFromPool(combined, rawTitle, artistName, idx);
+            // 2. Search specifically for "Artist + Exact Song Title" on iTunes (songTerm + general) and Deezer (strict track query)
+            if (songPart && !isGenericPlaceholderTrack(rawTitle)) {
+                const [songTermItunes, generalItunes, strictDeezer, generalDeezer] = await Promise.all([
+                    fetchItunesTracks(songPart, 15, "songTerm"),
+                    fetchItunesTracks(specificQuery, 15),
+                    fetchDeezerTracks(specificQuery, primaryArtist, songPart),
+                    fetchDeezerTracks(specificQuery)
+                ]);
+                const specificCombined = [...strictDeezer, ...songTermItunes, ...generalItunes, ...generalDeezer];
+                // Strictly require the song title to match (never fall back to specificCombined[0] if the title doesn't match!)
+                const exactHit = pickBestTrackFromPool(specificCombined, rawTitle, artistName, idx, true);
+                if (exactHit) {
+                    itunesCache[cacheKey] = exactHit;
+                    return exactHit;
+                }
+            }
+
+            // 3. Consult the full artist catalog pool
+            const artistPool = await ensureArtistCatalogPool(artistName);
+            // For named songs, require exact song match; for generic festival placeholders, pick a unique real track by index
+            const isPlaceholder = isGenericPlaceholderTrack(rawTitle);
+            const chosen = pickBestTrackFromPool(artistPool || [], rawTitle, artistName, idx, !isPlaceholder);
             if (chosen) {
                 itunesCache[cacheKey] = chosen;
                 return chosen;
@@ -2101,1078 +2165,58 @@
         }
 
         // Cross-platform resolver: takes an iTunes Track or Title and resolves BOTH real YouTube Video ID and real Spotify Track ID!
-        async function resolveCrossPlatformIds(rawTitle, artistName, trackIndexHint) {
-            if (ytIdCache[rawTitle] && spotifyIdCache[rawTitle] && !spotifyIdCache[rawTitle].includes("234234")) {
-                return {
-                    youtubeId: ytIdCache[rawTitle],
-                    spotifyId: spotifyIdCache[rawTitle]
-                };
-            }
-
-            // Step 1: Get exact song metadata & Apple Music trackId from iTunes (100% CORS-friendly on iOS & Android)
-            const itunesData = await fetchRealTrackStream(rawTitle, artistName, trackIndexHint);
-
-            // Step 2: Query Odesli/Songlink API using the Apple Music trackId to get official YouTube + Spotify IDs
-            if (itunesData && itunesData.trackId) {
+        async function resolveCrossPlatformIds(rawTitle, artistName, itunesTrackId) {
+            // 1. Try Odesli / Songlink API using iTunes trackId
+            if (itunesTrackId) {
                 try {
-                    const odesliUrl = `https://api.song.link/v1-alpha.1/links?id=${itunesData.trackId}&userCountry=MX&songIfSingle=true`;
+                    const odesliUrl = `https://api.song.link/v1-alpha.1/links?id=${encodeURIComponent(itunesTrackId)}&userCountry=MX&songIfSingle=true`;
                     const res = await fetch(odesliUrl);
                     if (res.ok) {
-                        const linkData = await res.json();
-                        const linksByPlatform = linkData.linksByPlatform || {};
-
-                        if (linksByPlatform.youtube && linksByPlatform.youtube.url) {
-                            const ytMatch = linksByPlatform.youtube.url.match(/[?&]v=([a-zA-Z0-9_-]{11})/);
-                            if (ytMatch && ytMatch[1]) {
-                                ytIdCache[rawTitle] = ytMatch[1];
-                            }
+                        const data = await res.json();
+                        const links = data && data.linksByPlatform ? data.linksByPlatform : {};
+                        if (links.youtube && links.youtube.url) {
+                            const m = links.youtube.url.match(/(?:v=|youtu\.be\/)([a-zA-Z0-9_-]{11})/);
+                            if (m && m[1]) ytIdCache[rawTitle] = m[1];
                         }
-                        if (linksByPlatform.spotify && linksByPlatform.spotify.url) {
-                            const spMatch = linksByPlatform.spotify.url.match(/track\/([a-zA-Z0-9]+)/);
-                            if (spMatch && spMatch[1]) {
-                                spotifyIdCache[rawTitle] = spMatch[1];
-                            }
+                        if (links.spotify && links.spotify.url) {
+                            const sm = links.spotify.url.match(/track\/([a-zA-Z0-9]{22})/);
+                            if (sm && sm[1]) spotifyIdCache[rawTitle] = sm[1];
                         }
                     }
                 } catch (e) {}
             }
 
-            // Step 3: If YouTube ID still not found, try Piped/Invidious search with the real found song title
-            if (!ytIdCache[rawTitle]) {
-                const searchTarget = (itunesData && itunesData.foundTrackName) ? itunesData.foundTrackName : rawTitle;
-                const vid = await resolveDynamicYouTubeId(searchTarget, artistName);
-                if (vid) ytIdCache[rawTitle] = vid;
-            }
-
-            return {
-                youtubeId: ytIdCache[rawTitle] || null,
-                spotifyId: (spotifyIdCache[rawTitle] && !spotifyIdCache[rawTitle].includes("234234")) ? spotifyIdCache[rawTitle] : null,
-                itunesData: itunesData
-            };
-        }
-
-        // Dynamically resolve the REAL full-length YouTube Video ID for ANY of the 1,520 tracks using public Piped/Invidious search APIs
-        // Because we embed by direct VIDEO_ID (/embed/VIDEO_ID), YouTube never triggers Error 153 and plays the full song/set!
-        async function resolveDynamicYouTubeId(rawTitle, artistName) {
             if (ytIdCache[rawTitle]) return ytIdCache[rawTitle];
 
-            const searchClean = rawTitle
-                .replace(/—/g, " ")
-                .replace(/EDC Mexico Festival Anthem Mix/i, "Live Set")
-                .replace(/Most Played Club Track/i, "Official Audio")
-                .replace(/Exclusive VIP Edit & Remix/i, "Remix")
-                .replace(/Peak Time Set Highlight/i, "Live")
-                .replace(/Unreleased ID & Bootleg Mix/i, "Club Mix")
-                .replace(/Extended Club Mix/i, "Extended Mix")
-                .replace(/Closing Track & Encore/i, "Festival Mix")
-                .trim();
-
-            const pipedEndpoints = [
-                `https://pipedapi.kavin.rocks/search?q=${encodeURIComponent(searchClean)}&filter=videos`,
-                `https://pipedapi.tokhmi.xyz/search?q=${encodeURIComponent(searchClean)}&filter=videos`,
-                `https://inv.tux.pizza/api/v1/search?q=${encodeURIComponent(searchClean)}&type=video`
+            // 2. Fallback Piped YouTube Search API for Video ID
+            const searchQ = cleanSearchQuery(rawTitle, artistName) + " official audio";
+            const endpoints = [
+                "https://pipedapi.kavin.rocks/search?filter=videos&q=",
+                "https://pipedapi.tokhmi.xyz/search?filter=videos&q=",
+                "https://pipedapi.moomoo.me/search?filter=videos&q="
             ];
 
-            for (let ep of pipedEndpoints) {
+            for (const base of endpoints) {
                 try {
                     const controller = new AbortController();
-                    const timeoutId = setTimeout(() => controller.abort(), 3200);
-                    const res = await fetch(ep, { signal: controller.signal });
-                    clearTimeout(timeoutId);
-                    if (!res.ok) continue;
-                    const data = await res.json();
-
-                    // Piped format: { items: [{ url: "/watch?v=XXXX" }] }
-                    if (data && Array.isArray(data.items) && data.items.length > 0) {
-                        const first = data.items.find(it => it.url && it.url.includes("v="));
-                        if (first) {
-                            const vid = first.url.split("v=")[1].split("&")[0];
-                            if (vid && vid.length === 11) {
-                                ytIdCache[rawTitle] = vid;
-                                return vid;
+                    const timer = setTimeout(() => controller.abort(), 2800);
+                    const res = await fetch(base + encodeURIComponent(searchQ), { signal: controller.signal });
+                    clearTimeout(timer);
+                    if (res.ok) {
+                        const json = await res.json();
+                        const items = Array.isArray(json.items) ? json.items : [];
+                        const firstVideo = items.find(it => it && it.url && it.url.includes("v="));
+                        if (firstVideo) {
+                            const m = firstVideo.url.match(/v=([a-zA-Z0-9_-]{11})/);
+                            if (m && m[1]) {
+                                ytIdCache[rawTitle] = m[1];
+                                return m[1];
                             }
                         }
                     }
-                    // Invidious format: [{ videoId: "XXXX" }]
-                    if (Array.isArray(data) && data.length > 0 && data[0].videoId) {
-                        const vid = data[0].videoId;
-                        ytIdCache[rawTitle] = vid;
-                        return vid;
-                    }
                 } catch (e) {}
             }
-
-            // Fallback: check if artist has any known video in cache
-            const lowerArtist = artistName.toLowerCase().split(/b2b|\+/i)[0].trim();
-            for (const [k, vid] of Object.entries(KNOWN_VIDEO_IDS)) {
-                if (k.toLowerCase().includes(lowerArtist)) {
-                    return vid;
-                }
-            }
             return null;
-        }
-
-        // Builds the interactive HTML for either the Inline Drawer or the Floating Dock Stage
-        function buildMediaStageHtml(contextId, title, artistName, stageName) {
-            const ytUrl = getYouTubeLink(title);
-            const spUrl = getSpotifySearchLink(title);
-            const safeTitleEsc = title.replace(/'/g, "\\'").replace(/"/g, "&quot;");
-
-            // ENGINE 1: FULL YOUTUBE VIDEO EMBED (Direct Video ID = Full Song/Set, No 30s limit, No Error 153)
-            if (playerEngine === "video") {
-                const directVid = currentMediaMeta.resolvedVideoId || ytIdCache[title];
-                if (currentMediaMeta.resolvingVideo && !directVid) {
-                    return `
-                        <div class="rave-stage-player" style="align-items:center; justify-content:center; text-align:center; min-height:210px;">
-                            <div style="font-family:'Orbitron',sans-serif; color:#00f5d4; font-size:0.95rem; margin-bottom:8px;">
-                                ⚡ Buscando Video Completo en YouTube para "${title}"...
-                            </div>
-                            <p style="font-size:0.78rem; color:#cbd5e1;">Conectando con el motor de video directo (sin Error 153 y duración completa)...</p>
-                        </div>
-                    `;
-                }
-
-                if (directVid) {
-                    const embedSrc = `https://www.youtube.com/embed/${directVid}?autoplay=1&playsinline=1&rel=0&modestbranding=1`;
-                    return `
-                        <div class="video-frame-wrap">
-                            <iframe src="${embedSrc}" referrerpolicy="strict-origin-when-cross-origin" title="${safeTitleEsc}" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" playsinline webkit-playsinline allowfullscreen></iframe>
-                        </div>
-                        <div class="video-helper-bar">
-                            <span style="color:#00f5d4; font-weight:700;">✅ Video Oficial Cargado (${currentMediaMeta.foundTrackName || title})</span>
-                            <div style="display:flex; gap:6px; flex-wrap:wrap;">
-                                <button type="button" class="mini-chip-btn" style="border-color:#ffee00; color:#ffee00;" onclick="setPlayerEngine('audio')">🎧 Cambiar a Audio Directo</button>
-                                <button type="button" class="mini-chip-btn" style="border-color:#1ed760; color:#1ed760;" onclick="setPlayerEngine('spotify')">🟢 Spotify Embed</button>
-                                <a href="${ytUrl}" target="_blank" rel="noopener noreferrer" class="yt-btn">↗ App YouTube</a>
-                            </div>
-                        </div>
-                    `;
-                }
-
-                // If public search API was unreachable for an obscure artist, show instant Spotify + Audio + Pop-up cards
-                return `
-                    <div class="rave-stage-player" style="justify-content:center; text-align:center; gap:12px;">
-                        <div style="font-family:'Orbitron',sans-serif; font-size:0.95rem; color:#ffee00;">
-                            🎬 "${title}" — Selección Directa de Fuente Completa
-                        </div>
-                        <p style="font-size:0.8rem; color:#e2e8f0; max-width:520px; margin:0 auto;">
-                            Elige cómo reproducir esta pista completa ahora mismo:
-                        </p>
-                        <div style="display:flex; gap:10px; justify-content:center; flex-wrap:wrap; margin-top:4px;">
-                            <button type="button" class="play-pause-circle" onclick="setPlayerEngine('audio')">
-                                🎧 Reproducir Stream de Audio Aquí
-                            </button>
-                            <button type="button" class="sp-btn" style="padding:8px 14px; font-size:0.8rem; cursor:pointer;" onclick="setPlayerEngine('spotify')">
-                                🟢 Abrir Reproductor Spotify
-                            </button>
-                            <button type="button" class="mini-chip-btn" style="padding:8px 14px; border-color:#00f5d4; color:#00f5d4;" onclick="openYouTubePopup('${safeTitleEsc}')">
-                                🚀 Abrir Video en Mini-Ventana YT
-                            </button>
-                        </div>
-                    </div>
-                `;
-            }
-
-            // ENGINE 2: SPOTIFY INTEGRATION (Official Spotify Embed + Direct App/Web Launcher)
-            if (playerEngine === "spotify") {
-                const spTrackId = currentMediaMeta.spotifyTrackId ||
-                    ((spotifyIdCache[title] && !spotifyIdCache[title].includes("234234")) ? spotifyIdCache[title] : null);
-
-                const embedUrl = spTrackId
-                    ? `https://open.spotify.com/embed/track/${spTrackId}?utm_source=generator&theme=0`
-                    : `https://open.spotify.com/embed/playlist/37i9dQZF1DX4dyzvuaRJ0n?utm_source=generator&theme=0`;
-
-                return `
-                    <div style="background:#080810; border:1px solid rgba(29,185,84,0.5); border-radius:14px; padding:12px;">
-                        <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px; margin-bottom:10px;">
-                            <div>
-                                <span style="color:#1ed760; font-size:0.74rem; font-weight:800; text-transform:uppercase;">🟢 Reproductor Oficial Spotify • ${spTrackId ? 'Canción Exacta Vinculada' : 'Playlist Electrónica + Búsqueda Directa'}</span>
-                                <div style="font-weight:800; font-size:0.9rem; color:#ffffff;">${currentMediaMeta.foundTrackName || title}</div>
-                            </div>
-                            <a href="${spUrl}" target="_blank" rel="noopener noreferrer" class="sp-btn" style="padding:7px 14px; font-size:0.8rem;">
-                                🟢 Abrir en App Spotify ↗
-                            </a>
-                        </div>
-                        <iframe style="border-radius:12px" src="${embedUrl}" width="100%" height="152" frameBorder="0" allowfullscreen="" allow="autoplay; clipboard-write; encrypted-media; fullscreen; picture-in-picture" playsinline webkit-playsinline></iframe>
-                    </div>
-                `;
-            }
-
-            // ENGINE 3: NATIVE AUDIO STREAM + INTERACTIVE CONTROLLER (Fixed CORS + iOS Multi-Track Unlock)
-            const initials = artistName.slice(0, 2).toUpperCase();
-            const artHtml = currentMediaMeta.artworkUrl
-                ? `<img id="stageArt_${contextId}" src="${currentMediaMeta.artworkUrl}" alt="${safeTitleEsc}" onerror="this.style.display='none'">`
-                : `<span id="stageArt_${contextId}">${initials}</span>`;
-
-            let statusLabel = "⚡ Cargando Audio Oficial de " + artistName + "...";
-            if (currentMediaMeta.status === "playing-stream") {
-                statusLabel = "🎧 Reproduciendo Audio Oficial (Apple Music / Deezer)";
-            } else if (currentMediaMeta.status === "ready-to-tap" || currentMediaMeta.status === "paused") {
-                statusLabel = "▶ Pista Oficial Lista — Toca Reproducir";
-            } else if (currentMediaMeta.status === "not-found") {
-                statusLabel = "📺 Pista Exclusiva de Festival — Usa Video Completo o Spotify";
-            }
-
-            const subText = currentMediaMeta.foundTrackName
-                ? `Sonando: ${currentMediaMeta.foundTrackName}`
-                : `${artistName} • ${stageName}`;
-
-            const isPlaying = currentMediaMeta.status === "playing-stream";
-
-            return `
-                <div class="rave-stage-player">
-                    <canvas id="raveCanvas_${contextId}" class="rave-canvas" width="600" height="220"></canvas>
-                    <div class="rave-stage-content">
-                        <div class="album-art-box" id="artBox_${contextId}">${artHtml}</div>
-                        <div class="stage-meta">
-                            <span class="stage-status-pill">
-                                <span class="pulse-dot"></span>
-                                <span id="stageStatusText_${contextId}">${statusLabel}</span>
-                            </span>
-                            <div class="stage-track-title" id="stageTitleText_${contextId}">${title}</div>
-                            <div class="stage-track-sub" id="stageSubText_${contextId}">${subText}</div>
-                        </div>
-                    </div>
-
-                    <div class="audio-deck-controls">
-                        <div class="seekbar-row">
-                            <span id="timeCur_${contextId}">0:00</span>
-                            <input type="range" id="seekSlider_${contextId}" class="seek-slider" min="0" max="100" step="0.5" value="0" oninput="seekGlobalAudio(this.value)">
-                            <span id="timeDur_${contextId}">0:30</span>
-                        </div>
-                        <div class="transport-row">
-                            <div style="display:flex; align-items:center; gap:6px; flex-wrap:wrap;">
-                                <button type="button" class="mini-chip-btn" onclick="playAdjacentTrack(-1)" title="Canción Anterior">⏮</button>
-                                <button type="button" id="playPauseBtn_${contextId}" class="play-pause-circle" onclick="togglePlayPauseGlobal()">
-                                    ${isPlaying ? '⏸ Pausar' : '▶ Reproducir Canción'}
-                                </button>
-                                <button type="button" class="mini-chip-btn" onclick="playAdjacentTrack(1)" title="Siguiente Canción">⏭</button>
-                                <span style="font-size:0.7rem; color:#94a3b8; margin-left:4px;">🔊</span>
-                                <input type="range" min="0" max="1" step="0.05" value="0.9" style="width:60px; accent-color:#00f5d4; cursor:pointer;" oninput="setGlobalVolume(this.value)" title="Volumen">
-                            </div>
-                            <div style="display:flex; align-items:center; gap:6px; flex-wrap:wrap;">
-                                <button type="button" class="mini-chip-btn" style="border-color:#00f5d4; color:#00f5d4;" onclick="setPlayerEngine('video')">
-                                    📺 Ver Video Completo
-                                </button>
-                                <a href="${spUrl}" target="_blank" rel="noopener noreferrer" class="sp-btn">
-                                    🟢 Spotify
-                                </a>
-                                <a href="${ytUrl}" target="_blank" rel="noopener noreferrer" class="yt-btn">
-                                    ↗ YouTube
-                                </a>
-                            </div>
-                        </div>
-                    </div>
-                </div>
-            `;
-        }
-
-        function renderAzBar() {
-            const bar = document.getElementById("azBar");
-            if (!bar) return;
-            const letters = ["ALL", "#", "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O", "P", "Q", "R", "S", "T", "U", "V", "W", "Y", "Z"];
-            let html = '<span class="az-label">Índice A–Z:</span>';
-            letters.forEach(l => {
-                const label = l === "ALL" ? "Todas" : l;
-                const activeClass = currentLetter === l ? "active" : "";
-                html += `<button type="button" class="az-btn ${activeClass}" onclick="setLetter('${l}')">${label}</button>`;
-            });
-            bar.innerHTML = html;
-        }
-
-        function setLetter(letter) {
-            currentLetter = letter;
-            renderAzBar();
-            renderApp();
-        }
-
-        function updateBadges() {
-            const rBadge = document.getElementById("routeCountBadge");
-            const lBadge = document.getElementById("likedCountBadge");
-            if (rBadge) rBadge.textContent = savedRoute.size;
-            if (lBadge) lBadge.textContent = likedTracks.size;
-        }
-
-        function renderApp() {
-            const grid = document.getElementById("artistsGrid");
-            const emptyState = document.getElementById("emptyState");
-            const counter = document.getElementById("resultsCounter");
-            if (!grid) return;
-
-            const q = searchQuery.trim().toLowerCase();
-
-            const filtered = ARTISTS_DATA.filter(artist => {
-                if (currentLetter !== "ALL" && artist.letter !== currentLetter) {
-                    return false;
-                }
-                if (currentCategory === "ruta") {
-                    if (!savedRoute.has(artist.id)) return false;
-                } else if (currentCategory === "favoritas") {
-                    const hasLiked = artist.tracks.some((_, i) => likedTracks.has(artist.id + "__" + i));
-                    if (!hasLiked) return false;
-                } else if (currentCategory !== "all") {
-                    if (!artist.categories.includes(currentCategory)) return false;
-                }
-
-                if (!q) return true;
-                const matchArtist = artist.name.toLowerCase().includes(q) ||
-                                    artist.genre.toLowerCase().includes(q) ||
-                                    artist.stage.toLowerCase().includes(q);
-                const matchTrack = artist.tracks.some(t => t.title.toLowerCase().includes(q) || t.role.toLowerCase().includes(q));
-                return matchArtist || matchTrack;
-            });
-
-            if (filtered.length === 0) {
-                grid.innerHTML = "";
-                emptyState.style.display = "block";
-                counter.textContent = "0 artistas encontrados con este filtro";
-                return;
-            }
-
-            emptyState.style.display = "none";
-            counter.textContent = "Mostrando " + filtered.length + " de " + ARTISTS_DATA.length + " artistas del cartel oficial (" + (filtered.length * 10) + " enlaces directos a YouTube)";
-
-            let html = "";
-            for (let i = 0; i < filtered.length; i++) {
-                const artist = filtered[i];
-                const isSaved = savedRoute.has(artist.id);
-                const isExpanded = expandedArtists.has(artist.id) || q.length > 0 || currentCategory === "favoritas" || currentLetter !== "ALL";
-                const liveSetUrl = getYouTubeLink(artist.name + " Live Set EDC");
-                const artistSpotifyUrl = getSpotifySearchLink(artist.name);
-                const orderNum = String(artist.index).padStart(3, "0");
-                const liveSetInlineKey = artist.id + "__liveset";
-                const isLiveSetInlineOpen = activeInlineTrackKey === liveSetInlineKey;
-
-                let tracksHtml = "";
-                for (let idx = 0; idx < artist.tracks.length; idx++) {
-                    const track = artist.tracks[idx];
-                    const trackKey = artist.id + "__" + idx;
-                    const isLiked = likedTracks.has(trackKey);
-                    const ytUrl = getYouTubeLink(track.title);
-                    const spUrl = getSpotifySearchLink(track.title);
-                    const isHighlight = q.length > 0 && (track.title.toLowerCase().includes(q) || track.role.toLowerCase().includes(q));
-                    const numStr = String(idx + 1).padStart(2, "0");
-                    const isInlineOpen = activeInlineTrackKey === trackKey;
-
-                    let inlineDrawerHtml = "";
-                    if (isInlineOpen) {
-                        const stageHtml = buildMediaStageHtml("inline", track.title, artist.name, artist.stage);
-                        inlineDrawerHtml = `
-                            <div class="inline-video-drawer no-print">
-                                <div class="inline-video-header">
-                                    <span style="color:#00f5d4; font-weight:800;">⚡ Reproductor Multimedia EDC 2027: ${track.title}</span>
-                                    <div style="display:flex; gap:6px; align-items:center;">
-                                        <button type="button" class="mini-chip-btn" onclick="openInDock('${artist.id}', ${idx}, false)">📺 Fijar en Player Flotante</button>
-                                        <button type="button" class="mini-chip-btn" style="color:#ff007f; border-color:#ff007f;" onclick="toggleInlineVideo('${trackKey}')">✕ Cerrar</button>
-                                    </div>
-                                </div>
-                                <div class="engine-tabs">
-                                    <button type="button" class="engine-tab ${playerEngine==='video'?'active':''}" onclick="setPlayerEngine('video')">📺 Video Completo YouTube (Recomendado)</button>
-                                    <button type="button" class="engine-tab ${playerEngine==='spotify'?'active':''}" onclick="setPlayerEngine('spotify')">🟢 Spotify Embed</button>
-                                    <button type="button" class="engine-tab ${playerEngine==='audio'?'active':''}" onclick="setPlayerEngine('audio')">🎧 Preview Audio + Láser</button>
-                                    <button type="button" class="engine-tab" onclick="openYouTubePopup('${track.title.replace(/'/g, "\\'")}')">🚀 Mini-Ventana YT</button>
-                                </div>
-                                <div id="inlineMediaStageContainer">${stageHtml}</div>
-                            </div>
-                        `;
-                    }
-
-                    tracksHtml += `
-                        <div class="track-row ${isHighlight ? 'highlight' : ''}">
-                            <div class="track-left">
-                                <button type="button" class="heart-btn ${isLiked ? 'liked' : ''} no-print" onclick="toggleLike('${trackKey}')" title="Guardar en canciones favoritas">
-                                    ${isLiked ? '♥' : '♡'}
-                                </button>
-                                <span class="track-num">${numStr}</span>
-                                <div class="track-info">
-                                    <div class="track-title">${track.title}</div>
-                                    <span class="track-role">${track.role}</span>
-                                </div>
-                            </div>
-                            <div class="track-actions no-print">
-                                <button type="button" class="play-inline-btn ${isInlineOpen ? 'active' : ''}" onclick="toggleInlineVideo('${trackKey}')" title="Reproducir video completo, Spotify o audio aquí mismo">
-                                    ${isInlineOpen ? '▲ Ocultar Player' : '▶ Escuchar Aquí'}
-                                </button>
-                                <button type="button" class="mini-chip-btn" onclick="openInDock('${artist.id}', ${idx}, false)" title="Enviar al reproductor flotante continuo">
-                                    📺
-                                </button>
-                                <a href="${spUrl}" target="_blank" rel="noopener noreferrer" class="sp-btn" title="Escuchar canción completa en Spotify">
-                                    🟢
-                                </a>
-                                <a href="${ytUrl}" target="_blank" rel="noopener noreferrer" class="yt-btn" title="Abrir en pestaña de YouTube">
-                                    ↗ YT
-                                </a>
-                            </div>
-                        </div>
-                        ${inlineDrawerHtml}
-                    `;
-                }
-
-                let liveSetInlineHtml = "";
-                if (isLiveSetInlineOpen) {
-                    const liveQueryTitle = artist.name + " — Live Set EDC Festival";
-                    const liveStageHtml = buildMediaStageHtml("inline", liveQueryTitle, artist.name, artist.stage);
-                    liveSetInlineHtml = `
-                        <div class="inline-video-drawer no-print" style="border-top:1px solid rgba(255,0,127,0.4);">
-                            <div class="inline-video-header">
-                                <span style="color:#ffee00; font-weight:800;">🎥 Live Set Integrado: ${artist.name} (${artist.stage})</span>
-                                <div style="display:flex; gap:6px;">
-                                    <button type="button" class="mini-chip-btn" onclick="openInDock('${artist.id}', 0, true)">📺 Pasar al Player Flotante</button>
-                                    <button type="button" class="mini-chip-btn" style="color:#ff007f; border-color:#ff007f;" onclick="toggleInlineVideo('${liveSetInlineKey}')">✕ Cerrar</button>
-                                </div>
-                            </div>
-                            <div class="engine-tabs">
-                                <button type="button" class="engine-tab ${playerEngine==='video'?'active':''}" onclick="setPlayerEngine('video')">📺 Live Set Completo YouTube</button>
-                                <button type="button" class="engine-tab ${playerEngine==='spotify'?'active':''}" onclick="setPlayerEngine('spotify')">🟢 Spotify Artista</button>
-                                <button type="button" class="engine-tab ${playerEngine==='audio'?'active':''}" onclick="setPlayerEngine('audio')">🎧 Preview Audio + Láser</button>
-                            </div>
-                            <div id="inlineMediaStageContainer">${liveStageHtml}</div>
-                        </div>
-                    `;
-                }
-
-                html += `
-                    <article class="artist-card">
-                        <div class="card-accent-bar"></div>
-                        <div class="card-header">
-                            <div class="card-top-row">
-                                <div>
-                                    <span class="number-badge">#${orderNum}</span>
-                                    <span class="stage-badge">${artist.stage}</span>
-                                    <span class="genre-label">${artist.genre}</span>
-                                    <h2 class="artist-name">${artist.name}</h2>
-                                </div>
-                                <button type="button" class="route-btn ${isSaved ? 'saved' : ''} no-print" onclick="toggleRoute('${artist.id}')">
-                                    ${isSaved ? '★ En Mi Ruta' : '+ Mi Ruta'}
-                                </button>
-                            </div>
-                            <p class="artist-vibe">${artist.vibe}</p>
-                            <div class="card-actions-bar no-print">
-                                <button type="button" class="toggle-tracks-btn" onclick="toggleArtistTracks('${artist.id}')">
-                                    ${isExpanded ? '▲ Ocultar Top 10 Canciones' : '▼ Ver Top 10 Canciones (10 Tracks)'}
-                                </button>
-                                <div style="display:flex; gap:6px; flex-wrap:wrap;">
-                                    <button type="button" class="liveset-link" style="cursor:pointer;" onclick="toggleInlineVideo('${liveSetInlineKey}')">
-                                        ${isLiveSetInlineOpen ? '▲ Ocultar Live Set' : '🎥 Ver Live Set Aquí'}
-                                    </button>
-                                    <a href="${artistSpotifyUrl}" target="_blank" rel="noopener noreferrer" class="sp-btn">
-                                        🟢 Spotify
-                                    </a>
-                                    <a href="${liveSetUrl}" target="_blank" rel="noopener noreferrer" class="liveset-link">
-                                        ↗ Set en YT
-                                    </a>
-                                </div>
-                            </div>
-                        </div>
-                        ${liveSetInlineHtml}
-                        <div class="tracks-list ${isExpanded ? '' : 'collapsed'}">
-                            ${tracksHtml}
-                        </div>
-                    </article>
-                `;
-            }
-
-            grid.innerHTML = html;
-            updateBadges();
-            startLaserVisualizerLoop();
-            observeArtistCardsForPreload();
-        }
-
-        // Automatically preloads the real audio catalog of visible artists so iPhone taps are 100% synchronous (0ms wait)
-        let cardObserver = null;
-        function observeArtistCardsForPreload() {
-            if (typeof IntersectionObserver === "undefined") return;
-            if (cardObserver) cardObserver.disconnect();
-
-            cardObserver = new IntersectionObserver((entries) => {
-                entries.forEach(entry => {
-                    if (entry.isIntersecting) {
-                        const artistName = entry.target.getAttribute("data-artist-name");
-                        if (artistName) {
-                            ensureArtistCatalogPool(artistName).catch(() => {});
-                        }
-                        cardObserver.unobserve(entry.target);
-                    }
-                });
-            }, { rootMargin: "300px" });
-
-            document.querySelectorAll(".artist-card").forEach((card, idx) => {
-                const h2 = card.querySelector(".artist-name");
-                if (h2) {
-                    card.setAttribute("data-artist-name", h2.textContent.trim());
-                    if (idx < 6) {
-                        ensureArtistCatalogPool(h2.textContent.trim()).catch(() => {});
-                    } else {
-                        cardObserver.observe(card);
-                    }
-                }
-            });
-        }
-
-        // Core Media Controller: Resolves Full YouTube Video ID, Spotify Embed, or Real Track Stream without losing iOS Audio Gesture
-        async function loadAndPlayTrackMedia(rawTitle, artistObj, trackIdxHint) {
-            const reqId = ++activePlayRequestId;
-            const audioEl = document.getElementById("globalHtml5Audio");
-            stopRaveSynth();
-
-            const tIdx = typeof trackIdxHint === "number" ? trackIdxHint : 0;
-            const cachedVid = ytIdCache[rawTitle] || null;
-            const cachedSp = (spotifyIdCache[rawTitle] && !spotifyIdCache[rawTitle].includes("234234"))
-                ? spotifyIdCache[rawTitle]
-                : null;
-            const instantStream = getInstantCachedStream(rawTitle, artistObj.name, tIdx);
-
-            currentMediaMeta = {
-                query: rawTitle,
-                artistName: artistObj.name,
-                genre: artistObj.genre || "",
-                stage: artistObj.stage,
-                trackIndex: tIdx,
-                status: instantStream ? "playing-stream" : "loading",
-                previewUrl: instantStream ? instantStream.previewUrl : null,
-                artworkUrl: instantStream ? instantStream.artworkUrl : null,
-                foundTrackName: instantStream ? instantStream.foundTrackName : "",
-                spotifyTrackId: cachedSp,
-                resolvedVideoId: cachedVid,
-                resolvingVideo: (playerEngine === "video" && !cachedVid)
-            };
-
-            // Si la pista ya fue iniciada síncronamente en unlockIosMediaSync(instantStream.previewUrl), solo actualizamos la interfaz
-            if (playerEngine === "audio" && instantStream && instantStream.previewUrl && audioEl) {
-                isPrimingSilentAudio = false;
-                audioEl.loop = false;
-                if (audioEl.src !== instantStream.previewUrl) {
-                    audioEl.src = instantStream.previewUrl;
-                    const syncPromise = audioEl.play();
-                    if (syncPromise && typeof syncPromise.catch === "function") {
-                        syncPromise.catch(() => {
-                            currentMediaMeta.status = "ready-to-tap";
-                            updatePlayerStageDomOnly();
-                        });
-                    }
-                }
-                updatePlayerStageDomOnly();
-                return;
-            }
-
-            updatePlayerStageDomOnly();
-
-            // 1. AUDIO ENGINE: Uses Dual-Catalog (Apple Music/iTunes + Deezer JSONP) and NEVER falls back to fake synth
-            if (playerEngine === "audio") {
-                const streamData = await fetchRealTrackStream(rawTitle, artistObj.name, tIdx);
-                if (reqId !== activePlayRequestId) return;
-
-                if (streamData && streamData.previewUrl && audioEl) {
-                    currentMediaMeta.previewUrl = streamData.previewUrl;
-                    currentMediaMeta.artworkUrl = streamData.artworkUrl;
-                    currentMediaMeta.foundTrackName = streamData.foundTrackName;
-                    currentMediaMeta.status = "playing-stream";
-
-                    try {
-                        isPrimingSilentAudio = false;
-                        audioEl.loop = false;
-                        audioEl.src = streamData.previewUrl;
-                        const playPromise = audioEl.play();
-                        if (playPromise !== undefined) {
-                            await playPromise;
-                        }
-                    } catch (playErr) {
-                        // Si el navegador interno de WhatsApp en iOS requiere confirmar el toque tras la primera descarga,
-                        // dejamos cargada la canción real lista para sonar al instante al tocar "▶ Reproducir Canción".
-                        currentMediaMeta.status = "ready-to-tap";
-                    }
-                } else {
-                    isPrimingSilentAudio = false;
-                    if (audioEl) {
-                        audioEl.loop = false;
-                        audioEl.pause();
-                    }
-                    currentMediaMeta.status = "not-found";
-                }
-
-                updatePlayerStageDomOnly();
-                return;
-            }
-
-            // 2. VIDEO OR SPOTIFY ENGINE: Resolve real YouTube Video ID & Spotify Track ID via iTunes + Odesli Cross-Platform API
-            isPrimingSilentAudio = false;
-            if (audioEl) {
-                audioEl.loop = false;
-                audioEl.pause();
-            }
-
-            const resolved = await resolveCrossPlatformIds(rawTitle, artistObj.name, tIdx);
-            if (reqId !== activePlayRequestId) return;
-
-            if (resolved.itunesData) {
-                currentMediaMeta.previewUrl = resolved.itunesData.previewUrl;
-                currentMediaMeta.artworkUrl = resolved.itunesData.artworkUrl;
-                currentMediaMeta.foundTrackName = resolved.itunesData.foundTrackName;
-            }
-            currentMediaMeta.resolvedVideoId = resolved.youtubeId;
-            currentMediaMeta.spotifyTrackId = resolved.spotifyId;
-            currentMediaMeta.resolvingVideo = false;
-
-            if (playerEngine === "video" && !currentMediaMeta.resolvedVideoId && currentMediaMeta.previewUrl && audioEl) {
-                playerEngine = "audio";
-                currentMediaMeta.status = "playing-stream";
-                try {
-                    audioEl.loop = false;
-                    audioEl.src = currentMediaMeta.previewUrl;
-                    await audioEl.play();
-                } catch (e) {
-                    currentMediaMeta.status = "paused";
-                }
-            }
-
-            updatePlayerStageDomOnly();
-        }
-
-        // Targeted DOM update so buttons/sliders inside the player NEVER lose focus or break when clicked
-        function updatePlayerStageDomOnly() {
-            if (dockState.open) {
-                const dockContainer = document.getElementById("dockMediaStage");
-                const artist = ARTISTS_DATA[dockState.artistIndex] || ARTISTS_DATA[0];
-                const displayTitle = currentMediaMeta.query || artist.name;
-                if (dockContainer) {
-                    dockContainer.innerHTML = buildMediaStageHtml("dock", displayTitle, artist.name, artist.stage);
-                }
-            }
-            if (activeInlineTrackKey) {
-                const inlineContainer = document.getElementById("inlineMediaStageContainer");
-                if (inlineContainer) {
-                    inlineContainer.innerHTML = buildMediaStageHtml("inline", currentMediaMeta.query, currentMediaMeta.artistName, currentMediaMeta.stage);
-                }
-            }
-            startLaserVisualizerLoop();
-        }
-
-        function refreshActivePlayerContainers() {
-            updatePlayerStageDomOnly();
-        }
-
-        function setPlayerEngine(engine) {
-            unlockIosMediaSync();
-            playerEngine = engine;
-            const audioEl = document.getElementById("globalHtml5Audio");
-            if (engine !== "audio") {
-                if (audioEl) audioEl.pause();
-                stopRaveSynth();
-            }
-
-            // Update active tab styling in Dock and Inline
-            ["dockTabVideo", "dockTabSpotify", "dockTabAudio"].forEach(id => {
-                const el = document.getElementById(id);
-                if (!el) return;
-                const match = (id === "dockTabVideo" && engine === "video") ||
-                              (id === "dockTabSpotify" && engine === "spotify") ||
-                              (id === "dockTabAudio" && engine === "audio");
-                el.classList.toggle("active", match);
-            });
-
-            if (activeInlineTrackKey) {
-                renderApp();
-            }
-
-            if (currentMediaMeta.query) {
-                const parts = (activeInlineTrackKey || "").split("__");
-                const artistObj = ARTISTS_DATA.find(a => a.id === parts[0]) || ARTISTS_DATA[dockState.artistIndex] || ARTISTS_DATA[0];
-                const tIdx = parts[1] && parts[1] !== "liveset" ? parseInt(parts[1], 10) : dockState.trackIndex;
-                loadAndPlayTrackMedia(currentMediaMeta.query, artistObj, tIdx);
-            } else {
-                updatePlayerStageDomOnly();
-            }
-        }
-
-        function setGlobalVolume(val) {
-            const audioEl = document.getElementById("globalHtml5Audio");
-            if (audioEl) {
-                audioEl.volume = Math.max(0, Math.min(1, parseFloat(val)));
-            }
-        }
-
-        function togglePlayPauseGlobal() {
-            const audioEl = document.getElementById("globalHtml5Audio");
-            if (currentMediaMeta.status === "playing-stream" && audioEl && !audioEl.paused) {
-                audioEl.pause();
-                currentMediaMeta.status = "paused";
-            } else if (currentMediaMeta.previewUrl && audioEl) {
-                isPrimingSilentAudio = false;
-                audioEl.loop = false;
-                if (audioEl.src !== currentMediaMeta.previewUrl) {
-                    audioEl.src = currentMediaMeta.previewUrl;
-                }
-                audioEl.play().catch(() => {});
-                currentMediaMeta.status = "playing-stream";
-            } else if (currentMediaMeta.query) {
-                const parts = (activeInlineTrackKey || "").split("__");
-                const artistObj = ARTISTS_DATA.find(a => a.id === parts[0]) || ARTISTS_DATA[dockState.artistIndex] || ARTISTS_DATA[0];
-                const tIdx = parts[1] && parts[1] !== "liveset" ? parseInt(parts[1], 10) : dockState.trackIndex;
-                unlockIosMediaSync(null);
-                loadAndPlayTrackMedia(currentMediaMeta.query, artistObj, tIdx);
-                return;
-            }
-
-            const isPlaying = currentMediaMeta.status === "playing-stream";
-            ["inline", "dock"].forEach(cid => {
-                const btn = document.getElementById("playPauseBtn_" + cid);
-                const st = document.getElementById("stageStatusText_" + cid);
-                if (btn) btn.innerHTML = isPlaying ? "⏸ Pausar" : "▶ Reproducir Canción";
-                if (st) st.textContent = isPlaying ? "🎧 Reproduciendo Audio Oficial (Apple Music / Deezer)" : "⏸ Reproducción en Pausa";
-            });
-        }
-
-        function toggleRaveSynthManual() {
-            const audioEl = document.getElementById("globalHtml5Audio");
-            if (audioEl) audioEl.pause();
-            if (synthInterval) {
-                stopRaveSynth();
-                currentMediaMeta.status = "paused";
-            } else {
-                startRaveSynth(currentMediaMeta.query, currentMediaMeta.genre);
-                currentMediaMeta.status = "playing-synth";
-            }
-            updatePlayerStageDomOnly();
-        }
-
-        function seekGlobalAudio(val) {
-            const audioEl = document.getElementById("globalHtml5Audio");
-            if (audioEl && audioEl.duration && isFinite(audioEl.duration)) {
-                audioEl.currentTime = (parseFloat(val) / 100) * audioEl.duration;
-            }
-        }
-
-        function formatSec(sec) {
-            if (!sec || isNaN(sec)) return "0:00";
-            const m = Math.floor(sec / 60);
-            const s = Math.floor(sec % 60);
-            return m + ":" + String(s).padStart(2, "0");
-        }
-
-        // Bind HTML5 Audio progress events
-        (function setupGlobalAudioEvents() {
-            const audioEl = document.getElementById("globalHtml5Audio");
-            if (!audioEl) return;
-
-            audioEl.addEventListener("timeupdate", () => {
-                if (isPrimingSilentAudio || (audioEl.src && audioEl.src.startsWith("data:audio/"))) return;
-                const pct = audioEl.duration ? (audioEl.currentTime / audioEl.duration) * 100 : 0;
-                ["inline", "dock"].forEach(cid => {
-                    const slider = document.getElementById("seekSlider_" + cid);
-                    const curEl = document.getElementById("timeCur_" + cid);
-                    const durEl = document.getElementById("timeDur_" + cid);
-                    if (slider) slider.value = pct;
-                    if (curEl) curEl.textContent = formatSec(audioEl.currentTime);
-                    if (durEl) durEl.textContent = formatSec(audioEl.duration || 30);
-                });
-            });
-
-            audioEl.addEventListener("ended", () => {
-                if (isPrimingSilentAudio || (audioEl.src && audioEl.src.startsWith("data:audio/"))) return;
-                if (dockState.open) {
-                    playAdjacentTrack(1);
-                } else {
-                    currentMediaMeta.status = "paused";
-                    refreshActivePlayerContainers();
-                }
-            });
-        })();
-
-        // 60fps Animated EDC Neon Laser & Spectrum Canvas Visualizer
-        function startLaserVisualizerLoop() {
-            if (visualizerRaf) cancelAnimationFrame(visualizerRaf);
-            let tick = 0;
-
-            function drawFrame() {
-                tick += 0.06;
-                const canvases = [
-                    document.getElementById("raveCanvas_inline"),
-                    document.getElementById("raveCanvas_dock")
-                ].filter(Boolean);
-
-                if (canvases.length === 0) return;
-
-                const isPlaying = currentMediaMeta.status === "playing-stream" || currentMediaMeta.status === "playing-synth";
-
-                canvases.forEach(canvas => {
-                    const ctx = canvas.getContext("2d");
-                    const w = canvas.width;
-                    const h = canvas.height;
-                    ctx.clearRect(0, 0, w, h);
-
-                    // Top laser beams radiating from center stage
-                    const laserCount = 7;
-                    for (let i = 0; i < laserCount; i++) {
-                        const angle = Math.sin(tick * 0.7 + i * 0.9) * 0.65;
-                        ctx.save();
-                        ctx.beginPath();
-                        ctx.moveTo(w / 2, 0);
-                        ctx.lineTo(w / 2 + Math.tan(angle) * h * 1.4, h);
-                        ctx.strokeStyle = i % 2 === 0 ? "rgba(0, 245, 212, 0.22)" : "rgba(255, 0, 127, 0.22)";
-                        ctx.lineWidth = isPlaying ? 2.5 : 1;
-                        ctx.stroke();
-                        ctx.restore();
-                    }
-
-                    // Bottom 36-bar frequency spectrum
-                    const bars = 36;
-                    const barW = (w - 24) / bars;
-                    for (let b = 0; b < bars; b++) {
-                        const wave = isPlaying
-                            ? Math.abs(Math.sin(tick * 2.2 + b * 0.35) * Math.cos(tick * 1.3 - b * 0.2))
-                            : 0.08;
-                        const barH = Math.max(4, wave * (h * 0.48));
-                        const x = 12 + b * barW;
-                        const y = h - barH;
-
-                        const grad = ctx.createLinearGradient(x, y, x, h);
-                        grad.addColorStop(0, "#00f5d4");
-                        grad.addColorStop(0.55, "#ff007f");
-                        grad.addColorStop(1, "#9d4edd");
-
-                        ctx.fillStyle = grad;
-                        ctx.fillRect(x, y, barW - 3, barH);
-                    }
-                });
-
-                visualizerRaf = requestAnimationFrame(drawFrame);
-            }
-
-            visualizerRaf = requestAnimationFrame(drawFrame);
-        }
-
-        // Toggle inline player right below the selected song or live set
-        function toggleInlineVideo(trackKey) {
-            if (activeInlineTrackKey === trackKey) {
-                activeInlineTrackKey = null;
-                isPrimingSilentAudio = false;
-                const audioEl = document.getElementById("globalHtml5Audio");
-                if (audioEl) {
-                    audioEl.loop = false;
-                    audioEl.pause();
-                }
-                stopRaveSynth();
-                renderApp();
-                return;
-            }
-
-            activeInlineTrackKey = trackKey;
-            const [artistId, idxOrLive] = trackKey.split("__");
-            expandedArtists.add(artistId);
-
-            const artistObj = ARTISTS_DATA.find(a => a.id === artistId) || ARTISTS_DATA[0];
-            const aIdx = ARTISTS_DATA.findIndex(a => a.id === artistId);
-            const tIdx = idxOrLive === "liveset" ? 0 : parseInt(idxOrLive, 10);
-            dockState.artistIndex = aIdx !== -1 ? aIdx : 0;
-            dockState.trackIndex = tIdx;
-
-            const rawTitle = idxOrLive === "liveset"
-                ? (artistObj.name + " — Live Set EDC Festival")
-                : (artistObj.tracks[tIdx]?.title || artistObj.name);
-
-            if (IS_IOS && idxOrLive !== "liveset") {
-                playerEngine = "audio";
-            }
-
-            const cachedStream = getInstantCachedStream(rawTitle, artistObj.name, tIdx);
-            unlockIosMediaSync(cachedStream ? cachedStream.previewUrl : null);
-
-            renderApp();
-            loadAndPlayTrackMedia(rawTitle, artistObj, tIdx);
-        }
-
-        // Open any track or Live Set in the persistent bottom-right Floating Player
-        function openInDock(artistId, trackIdx, isLiveSet) {
-            const aIdx = ARTISTS_DATA.findIndex(a => a.id === artistId);
-            if (aIdx === -1) return;
-
-            activeInlineTrackKey = null;
-            dockState.open = true;
-            dockState.artistIndex = aIdx;
-            dockState.trackIndex = trackIdx || 0;
-            dockState.isLiveSet = !!isLiveSet;
-            dockState.minimized = false;
-
-            const artistObj = ARTISTS_DATA[aIdx];
-            const rawTitle = dockState.isLiveSet
-                ? (artistObj.name + " — Full Live Set EDC")
-                : (artistObj.tracks[dockState.trackIndex]?.title || artistObj.name);
-
-            const cachedStream = getInstantCachedStream(rawTitle, artistObj.name, dockState.trackIndex);
-            unlockIosMediaSync(cachedStream ? cachedStream.previewUrl : null);
-
-            renderApp();
-            renderDockPlayer();
-            loadAndPlayTrackMedia(rawTitle, artistObj, dockState.trackIndex);
-        }
-
-        function renderDockPlayer() {
-            const dock = document.getElementById("floatingPlayerDock");
-            const container = document.getElementById("dockMediaStage");
-            const stageEl = document.getElementById("dockArtistStage");
-            const titleEl = document.getElementById("dockTrackTitle");
-            const extLink = document.getElementById("dockExternalYt");
-            const spLink = document.getElementById("dockExternalSpotify");
-
-            if (!dock || !container) return;
-
-            if (!dockState.open) {
-                dock.style.display = "none";
-                container.innerHTML = "";
-                return;
-            }
-
-            dock.style.display = "flex";
-            dock.classList.toggle("theater-mode", dockState.theater);
-            dock.classList.toggle("minimized", dockState.minimized);
-
-            const artist = ARTISTS_DATA[dockState.artistIndex];
-            const track = artist.tracks[dockState.trackIndex] || artist.tracks[0];
-            const displayTitle = dockState.isLiveSet
-                ? (artist.name + " — Full Live Set EDC")
-                : track.title;
-
-            stageEl.textContent = "⚡ " + artist.name + " • " + artist.stage;
-            titleEl.textContent = displayTitle;
-            if (extLink) extLink.href = getYouTubeLink(displayTitle);
-            if (spLink) spLink.href = getSpotifySearchLink(displayTitle);
-
-            container.innerHTML = buildMediaStageHtml("dock", displayTitle, artist.name, artist.stage);
-            startLaserVisualizerLoop();
-        }
-
-        function playAdjacentTrack(step) {
-            const artist = ARTISTS_DATA[dockState.artistIndex] || ARTISTS_DATA[0];
-            if (!artist) return;
-            dockState.isLiveSet = false;
-
-            let nextTrack = dockState.trackIndex + step;
-            if (nextTrack >= artist.tracks.length) {
-                dockState.artistIndex = (dockState.artistIndex + 1) % ARTISTS_DATA.length;
-                nextTrack = 0;
-            } else if (nextTrack < 0) {
-                dockState.artistIndex = (dockState.artistIndex - 1 + ARTISTS_DATA.length) % ARTISTS_DATA.length;
-                nextTrack = ARTISTS_DATA[dockState.artistIndex].tracks.length - 1;
-            }
-            dockState.trackIndex = nextTrack;
-
-            const nextArtist = ARTISTS_DATA[dockState.artistIndex];
-            const nextTitle = nextArtist.tracks[dockState.trackIndex].title;
-
-            const cachedStream = getInstantCachedStream(nextTitle, nextArtist.name, dockState.trackIndex);
-            unlockIosMediaSync(cachedStream ? cachedStream.previewUrl : null);
-
-            if (activeInlineTrackKey) {
-                activeInlineTrackKey = nextArtist.id + "__" + dockState.trackIndex;
-                expandedArtists.add(nextArtist.id);
-                renderApp();
-            }
-            if (dockState.open) {
-                renderDockPlayer();
-            }
-            loadAndPlayTrackMedia(nextTitle, nextArtist, dockState.trackIndex);
-        }
-
-        function toggleTheaterMode() {
-            dockState.theater = !dockState.theater;
-            dockState.minimized = false;
-            const dock = document.getElementById("floatingPlayerDock");
-            if (dock) {
-                dock.classList.toggle("theater-mode", dockState.theater);
-                dock.classList.remove("minimized");
-            }
-        }
-
-        function toggleMinimizeDock() {
-            dockState.minimized = !dockState.minimized;
-            const dock = document.getElementById("floatingPlayerDock");
-            if (dock) {
-                dock.classList.toggle("minimized", dockState.minimized);
-            }
-        }
-
-        function closeDockPlayer() {
-            dockState.open = false;
-            const audioEl = document.getElementById("globalHtml5Audio");
-            if (audioEl) audioEl.pause();
-            stopRaveSynth();
-            renderDockPlayer();
-        }
-
-        // Dynamic Multi-Genre Synthesizer that generates a unique BPM, scale & bassline for every single track!
-        function toggleRaveSynth() {
-            toggleRaveSynthManual();
-        }
-
-        function startRaveSynth(seedTitle, genreText) {
-            try {
-                const AudioContextClass = window.AudioContext || window.webkitAudioContext;
-                if (!audioCtx) audioCtx = new AudioContextClass();
-                if (audioCtx.state === "suspended") audioCtx.resume();
-
-                // Hash the track title so every track has its own distinct melody, BPM and synth timbre
-                const str = (seedTitle || "EDC2027") + (genreText || "");
-                let hash = 0;
-                for (let i = 0; i < str.length; i++) {
-                    hash = ((hash << 5) - hash) + str.charCodeAt(i);
-                    hash |= 0;
-                }
-                hash = Math.abs(hash);
-
-                const g = (genreText || "").toLowerCase();
-                let stepMs = 220; // ~136 BPM default
-                let waveType = "sawtooth";
-                let rootHz = [110, 123.47, 130.81, 146.83, 98, 164.81][hash % 6];
-
-                if (g.includes("hard") || g.includes("raw")) {
-                    stepMs = 190; // 158 BPM Hardstyle / Hard Techno
-                    waveType = "square";
-                } else if (g.includes("dubstep") || g.includes("riddim") || g.includes("bass")) {
-                    stepMs = 210; // 142 BPM Bass
-                    waveType = "sawtooth";
-                } else if (g.includes("house") || g.includes("disco")) {
-                    stepMs = 238; // 126 BPM Tech House
-                    waveType = "triangle";
-                }
-
-                const scaleRatios = [1, 1.189, 1.335, 1.498, 1.587, 1.782, 2];
-                const pattern = [];
-                for (let p = 0; p < 8; p++) {
-                    const ratio = scaleRatios[(hash + p * 3) % scaleRatios.length];
-                    pattern.push(rootHz * ratio);
-                }
-
-                let step = 0;
-                if (synthInterval) clearInterval(synthInterval);
-
-                synthInterval = setInterval(() => {
-                    const now = audioCtx.currentTime;
-                    if (step % 2 === 0) {
-                        const osc = audioCtx.createOscillator();
-                        const gain = audioCtx.createGain();
-                        osc.frequency.setValueAtTime(145, now);
-                        osc.frequency.exponentialRampToValueAtTime(36, now + 0.14);
-                        gain.gain.setValueAtTime(0.4, now);
-                        gain.gain.exponentialRampToValueAtTime(0.001, now + 0.16);
-                        osc.connect(gain);
-                        gain.connect(audioCtx.destination);
-                        osc.start(now);
-                        osc.stop(now + 0.17);
-                    }
-                    const bassOsc = audioCtx.createOscillator();
-                    const bassGain = audioCtx.createGain();
-                    bassOsc.type = waveType;
-                    bassOsc.frequency.setValueAtTime(pattern[step % pattern.length], now);
-                    bassGain.gain.setValueAtTime(0.13, now);
-                    bassGain.gain.exponentialRampToValueAtTime(0.001, now + 0.17);
-                    bassOsc.connect(bassGain);
-                    bassGain.connect(audioCtx.destination);
-                    bassOsc.start(now);
-                    bassOsc.stop(now + 0.18);
-
-                    step++;
-                }, stepMs);
-            } catch (e) {}
         }
 
         function stopRaveSynth() {
@@ -3180,55 +2224,624 @@
                 clearInterval(synthInterval);
                 synthInterval = null;
             }
-            const synthBar = document.getElementById("dockSynthBar");
-            if (synthBar) synthBar.classList.remove("active");
+        }
+
+        function stopAllPlayback() {
+            stopRaveSynth();
+            const audioEl = document.getElementById("globalHtml5Audio");
+            if (audioEl) {
+                try { audioEl.pause(); } catch (e) {}
+            }
+            currentMediaMeta.status = "paused";
+        }
+
+        function formatSec(sec) {
+            if (!sec || isNaN(sec) || !isFinite(sec)) return "0:00";
+            const s = Math.max(0, Math.floor(sec));
+            const mins = Math.floor(s / 60);
+            const rem = s % 60;
+            return mins + ":" + (rem < 10 ? "0" + rem : rem);
+        }
+
+        // Builds the interactive inner media stage for either Inline Drawer or Floating Dock
+        function buildMediaStageHtml(contextPrefix) {
+            const q = currentMediaMeta.query || "EDC Mexico 2027";
+            const artistName = currentMediaMeta.artistName || "EDC MEXICO";
+            const stage = currentMediaMeta.stage || "kineticFIELD";
+            const initials = artistName.replace(/[^A-Za-z0-9]/g, "").substring(0, 2).toUpperCase() || "ED";
+            const ytLink = getYouTubeLink(q);
+            const spLink = getSpotifySearchLink(q);
+
+            if (playerEngine === "video") {
+                const vidId = currentMediaMeta.resolvedVideoId || ytIdCache[q];
+                if (vidId) {
+                    const autoParam = IS_IOS ? "0" : "1";
+                    const embedSrc = `https://www.youtube.com/embed/${vidId}?autoplay=${autoParam}&playsinline=1&rel=0&modestbranding=1`;
+                    return `
+                        <div class="video-frame-wrap">
+                            <iframe
+                                src="${embedSrc}"
+                                title="${q.replace(/"/g, '&quot;')}"
+                                allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"
+                                referrerpolicy="origin"
+                                playsinline
+                                allowfullscreen>
+                            </iframe>
+                        </div>
+                        <div class="video-helper-bar">
+                            <span>📺 Video oficial cargado: <strong style="color:#00f5d4;">${q}</strong></span>
+                            <div style="display:flex; gap:6px;">
+                                <button type="button" class="mini-chip-btn" onclick="setPlayerEngine('audio')">🎧 Cambiar a Audio Directo</button>
+                                <a href="https://www.youtube.com/watch?v=${vidId}" target="_blank" rel="noopener noreferrer" class="yt-btn">↗ Abrir en YouTube App</a>
+                            </div>
+                        </div>
+                    `;
+                } else if (currentMediaMeta.resolvingVideo) {
+                    return `
+                        <div class="rave-stage-player" style="min-height:190px; align-items:center; justify-content:center; text-align:center;">
+                            <div class="stage-status-pill">🔍 BUSCANDO VIDEO OFICIAL EN TIEMPO REAL...</div>
+                            <div class="stage-track-title" style="margin-top:8px;">${q}</div>
+                            <p style="font-size:0.78rem; color:#cbd5e1; margin:8px 0 12px;">Localizando stream de video libre de Error 153 o cambia a Audio Directo / Spotify.</p>
+                            <div style="display:flex; gap:8px; justify-content:center; flex-wrap:wrap;">
+                                <button type="button" class="play-pause-circle" onclick="setPlayerEngine('audio')">🎧 Escuchar Audio Directo Ahora</button>
+                                <button type="button" class="mini-chip-btn" onclick="openYouTubePopup('${q.replace(/'/g, "\\'")}')">🚀 Abrir Mini-TV YouTube</button>
+                            </div>
+                        </div>
+                    `;
+                } else {
+                    return `
+                        <div class="rave-stage-player" style="min-height:190px; align-items:center; justify-content:center; text-align:center;">
+                            <div class="stage-status-pill" style="border-color:#ffee00; color:#ffee00;">⚡ VIDEO PROTEGIDO POR SELLO DISCOGRÁFICO</div>
+                            <div class="stage-track-title" style="margin-top:6px;">${q}</div>
+                            <p style="font-size:0.78rem; color:#cbd5e1; margin:8px 0 12px;">Usa el reproductor de <strong>Audio Oficial Directo</strong> aquí mismo o abre la Mini-Ventana de YouTube:</p>
+                            <div style="display:flex; gap:8px; justify-content:center; flex-wrap:wrap;">
+                                <button type="button" class="play-pause-circle" onclick="setPlayerEngine('audio')">🎧 Reproducir Audio Oficial Aquí</button>
+                                <button type="button" class="mini-chip-btn" onclick="openYouTubePopup('${q.replace(/'/g, "\\'")}')">🚀 Mini-Ventana YouTube</button>
+                                <a href="${ytLink}" target="_blank" rel="noopener noreferrer" class="yt-btn">↗ Ver en YouTube</a>
+                            </div>
+                        </div>
+                    `;
+                }
+            }
+
+            if (playerEngine === "spotify") {
+                const spId = currentMediaMeta.spotifyTrackId || spotifyIdCache[q];
+                if (spId && spId.length === 22 && !spId.includes("234234")) {
+                    return `
+                        <div style="border-radius:12px; overflow:hidden; border:1px solid rgba(29,185,84,0.5); background:#080810;">
+                            <iframe
+                                style="border-radius:12px; width:100%; height:152px; border:0;"
+                                src="https://open.spotify.com/embed/track/${spId}?utm_source=generator&theme=0"
+                                allow="autoplay; clipboard-write; encrypted-media; fullscreen; picture-in-picture"
+                                loading="lazy">
+                            </iframe>
+                        </div>
+                        <div class="video-helper-bar">
+                            <span>🟢 Reproductor Oficial Spotify: <strong style="color:#1ed760;">${q}</strong></span>
+                            <a href="${spLink}" target="_blank" rel="noopener noreferrer" class="sp-btn">🟢 Abrir en Spotify App</a>
+                        </div>
+                    `;
+                }
+                return `
+                    <div class="rave-stage-player" style="min-height:185px; align-items:center; justify-content:center; text-align:center;">
+                        <div class="stage-status-pill" style="color:#1ed760; border-color:#1ed760;">🟢 CONECTAR CON SPOTIFY</div>
+                        <div class="stage-track-title" style="margin-top:6px;">${q}</div>
+                        <p style="font-size:0.78rem; color:#cbd5e1; margin:8px 0 12px;">Escucha la pista en la aplicación de Spotify o usa el reproductor de Audio Directo aquí mismo:</p>
+                        <div style="display:flex; gap:8px; justify-content:center; flex-wrap:wrap;">
+                            <a href="${spLink}" target="_blank" rel="noopener noreferrer" class="sp-btn" style="padding:8px 14px; font-size:0.8rem;">🟢 Abrir Canción en Spotify</a>
+                            <button type="button" class="play-pause-circle" onclick="setPlayerEngine('audio')">🎧 Escuchar Audio Oficial Aquí</button>
+                        </div>
+                    </div>
+                `;
+            }
+
+            // Default / Audio Engine: Native HTML5 Stream + 60FPS Laser Visualizer
+            const artHtml = currentMediaMeta.artworkUrl
+                ? `<img src="${currentMediaMeta.artworkUrl}" alt="${artistName}">`
+                : `<span>${initials}</span>`;
+
+            let statusLabel = "🎧 REPRODUCIENDO AUDIO OFICIAL (APPLE MUSIC / DEEZER)";
+            if (currentMediaMeta.status === "loading") {
+                statusLabel = "⏳ CARGANDO PISTA OFICIAL DEL ARTISTA...";
+            } else if (currentMediaMeta.status === "paused") {
+                statusLabel = "⏸ REPRODUCCIÓN EN PAUSA";
+            } else if (currentMediaMeta.status === "unavailable") {
+                statusLabel = "📺 TRACK EXCLUSIVO DE VIDEO / LIVE SET";
+            }
+
+            const isPlaying = currentMediaMeta.status === "playing-stream";
+            const playBtnLabel = isPlaying ? "⏸ Pausar" : "▶ Reproducir Canción";
+            const subLine = currentMediaMeta.foundTrackName
+                ? `Sonando: ${currentMediaMeta.foundTrackName}`
+                : `${artistName} • ${stage}`;
+
+            return `
+                <div class="rave-stage-player">
+                    <canvas class="rave-canvas" id="${contextPrefix}RaveCanvas"></canvas>
+                    <div class="rave-stage-content">
+                        <div class="album-art-box">${artHtml}</div>
+                        <div class="stage-meta">
+                            <div class="stage-status-pill" data-role="status-pill">
+                                <span class="pulse-dot"></span>
+                                <span data-role="status-text">${statusLabel}</span>
+                            </div>
+                            <div class="stage-track-title">${q}</div>
+                            <div class="stage-track-sub">${subLine}</div>
+                        </div>
+                    </div>
+
+                    <div class="audio-deck-controls">
+                        <div class="seekbar-row">
+                            <span data-role="cur-time">0:00</span>
+                            <input type="range" class="seek-slider" data-role="seek-slider" min="0" max="30" step="0.1" value="0" oninput="onSeekAudio(this.value)">
+                            <span data-role="dur-time">0:30</span>
+                        </div>
+                        <div class="transport-row">
+                            <div style="display:flex; align-items:center; gap:6px; flex-wrap:wrap;">
+                                <button type="button" class="mini-chip-btn" onclick="playAdjacentTrack(-1)" title="Canción Anterior">⏮</button>
+                                <button type="button" class="play-pause-circle" data-role="play-pause-btn" onclick="toggleAudioPlayPause()">${playBtnLabel}</button>
+                                <button type="button" class="mini-chip-btn" onclick="playAdjacentTrack(1)" title="Siguiente Canción">⏭</button>
+                                <span style="font-size:0.75rem; margin-left:4px;">🔊</span>
+                                <input type="range" min="0" max="1" step="0.05" value="1" style="width:70px; accent-color:#00f5d4; cursor:pointer;" oninput="onVolumeChange(this.value)">
+                            </div>
+                            <div style="display:flex; align-items:center; gap:6px; flex-wrap:wrap;">
+                                <button type="button" class="mini-chip-btn" style="border-color:#00f5d4; color:#00f5d4;" onclick="setPlayerEngine('video')">📺 Ver Video Completo</button>
+                                <a href="${spLink}" target="_blank" rel="noopener noreferrer" class="sp-btn">🟢 Spotify</a>
+                                <a href="${ytLink}" target="_blank" rel="noopener noreferrer" class="yt-btn">↗ YouTube</a>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            `;
+        }
+
+        function refreshOpenPlayersUI() {
+            const inlineBox = document.getElementById("inlineMediaStage");
+            if (inlineBox) {
+                inlineBox.innerHTML = buildMediaStageHtml("inline");
+            }
+            const dockBox = document.getElementById("dockMediaStage");
+            if (dockBox && dockState.open) {
+                dockBox.innerHTML = buildMediaStageHtml("dock");
+            }
+
+            // Sync active tab styles
+            ["Video", "Spotify", "Audio"].forEach(tab => {
+                const mode = tab.toLowerCase();
+                const dockTab = document.getElementById("dockTab" + tab);
+                if (dockTab) dockTab.classList.toggle("active", playerEngine === mode);
+                const inlineTab = document.getElementById("inlineTab" + tab);
+                if (inlineTab) inlineTab.classList.toggle("active", playerEngine === mode);
+            });
+
+            startCanvasVisualizerLoop();
+        }
+
+        function syncTransportControlsOnly() {
+            const audioEl = document.getElementById("globalHtml5Audio");
+            const isPlaying = currentMediaMeta.status === "playing-stream" && audioEl && !audioEl.paused;
+            const playBtnLabel = isPlaying ? "⏸ Pausar" : "▶ Reproducir Canción";
+
+            document.querySelectorAll('[data-role="play-pause-btn"]').forEach(btn => {
+                btn.innerHTML = playBtnLabel;
+            });
+
+            let statusLabel = isPlaying
+                ? "🎧 REPRODUCIENDO AUDIO OFICIAL (APPLE MUSIC / DEEZER)"
+                : "⏸ REPRODUCCIÓN EN PAUSA";
+            if (currentMediaMeta.status === "loading") statusLabel = "⏳ CARGANDO PISTA OFICIAL DEL ARTISTA...";
+            if (currentMediaMeta.status === "unavailable") statusLabel = "📺 TRACK EXCLUSIVO DE VIDEO / LIVE SET";
+
+            document.querySelectorAll('[data-role="status-text"]').forEach(el => {
+                el.textContent = statusLabel;
+            });
+        }
+
+        async function loadAndPlayTrackMedia(queryText, artistName, stageName, trackIndexHint) {
+            const requestId = ++activePlayRequestId;
+            stopRaveSynth();
+
+            // Check if we already have this exact song in cache for 0ms synchronous iOS playback
+            const instantHit = getInstantCachedStream(queryText, artistName, trackIndexHint);
+            unlockIosMediaSync(instantHit ? instantHit.previewUrl : null);
+
+            currentMediaMeta = {
+                query: queryText,
+                artistName: artistName,
+                stage: stageName,
+                status: instantHit ? "playing-stream" : "loading",
+                previewUrl: instantHit ? instantHit.previewUrl : null,
+                artworkUrl: instantHit ? instantHit.artworkUrl : null,
+                foundTrackName: instantHit ? instantHit.foundTrackName : "",
+                spotifyTrackId: spotifyIdCache[queryText] || null,
+                resolvedVideoId: ytIdCache[queryText] || null,
+                resolvingVideo: !ytIdCache[queryText]
+            };
+
+            refreshOpenPlayersUI();
+
+            // Fetch real song stream if not already in synchronous cache
+            let streamData = instantHit;
+            if (!streamData) {
+                streamData = await fetchRealTrackStream(queryText, artistName, trackIndexHint);
+            }
+            if (requestId !== activePlayRequestId) return;
+
+            if (streamData && streamData.previewUrl) {
+                currentMediaMeta.previewUrl = streamData.previewUrl;
+                currentMediaMeta.artworkUrl = streamData.artworkUrl;
+                currentMediaMeta.foundTrackName = streamData.foundTrackName;
+
+                // Also update the track title in ARTISTS_DATA if it was a generic festival placeholder
+                if (isGenericPlaceholderTrack(queryText) && streamData.foundTrackName) {
+                    currentMediaMeta.query = streamData.foundTrackName;
+                }
+
+                const audioEl = document.getElementById("globalHtml5Audio");
+                if (audioEl && playerEngine === "audio") {
+                    try {
+                        isPrimingSilentAudio = false;
+                        audioEl.loop = false;
+                        if (audioEl.src !== streamData.previewUrl) {
+                            audioEl.src = streamData.previewUrl;
+                        }
+                        await audioEl.play();
+                        currentMediaMeta.status = "playing-stream";
+                    } catch (err) {
+                        currentMediaMeta.status = "paused";
+                    }
+                } else {
+                    currentMediaMeta.status = "paused";
+                }
+            } else {
+                const audioEl = document.getElementById("globalHtml5Audio");
+                if (audioEl && isPrimingSilentAudio) {
+                    isPrimingSilentAudio = false;
+                    audioEl.loop = false;
+                    try { audioEl.pause(); } catch (e) {}
+                }
+                currentMediaMeta.status = "unavailable";
+            }
+
+            refreshOpenPlayersUI();
+
+            // Resolve YouTube Video ID and Spotify ID in background
+            resolveCrossPlatformIds(queryText, artistName, streamData ? streamData.trackId : null).then(vidId => {
+                if (requestId !== activePlayRequestId) return;
+                currentMediaMeta.resolvingVideo = false;
+                if (vidId) currentMediaMeta.resolvedVideoId = vidId;
+                if (spotifyIdCache[queryText]) currentMediaMeta.spotifyTrackId = spotifyIdCache[queryText];
+                if (playerEngine === "video" || playerEngine === "spotify") {
+                    refreshOpenPlayersUI();
+                }
+            });
+        }
+
+        function setPlayerEngine(mode) {
+            playerEngine = mode;
+            const audioEl = document.getElementById("globalHtml5Audio");
+            if (mode === "audio") {
+                if (audioEl && currentMediaMeta.previewUrl) {
+                    isPrimingSilentAudio = false;
+                    audioEl.loop = false;
+                    if (audioEl.src !== currentMediaMeta.previewUrl) {
+                        audioEl.src = currentMediaMeta.previewUrl;
+                    }
+                    audioEl.play().then(() => {
+                        currentMediaMeta.status = "playing-stream";
+                        syncTransportControlsOnly();
+                    }).catch(() => {
+                        currentMediaMeta.status = "paused";
+                        syncTransportControlsOnly();
+                    });
+                }
+            } else {
+                if (audioEl) {
+                    try { audioEl.pause(); } catch (e) {}
+                }
+                currentMediaMeta.status = "paused";
+            }
+            refreshOpenPlayersUI();
+        }
+
+        function toggleAudioPlayPause() {
+            const audioEl = document.getElementById("globalHtml5Audio");
+            if (!audioEl) return;
+
+            if (currentMediaMeta.previewUrl) {
+                isPrimingSilentAudio = false;
+                audioEl.loop = false;
+                if (audioEl.src !== currentMediaMeta.previewUrl) {
+                    audioEl.src = currentMediaMeta.previewUrl;
+                }
+                if (audioEl.paused) {
+                    audioEl.play().then(() => {
+                        currentMediaMeta.status = "playing-stream";
+                        syncTransportControlsOnly();
+                    }).catch(() => {});
+                } else {
+                    audioEl.pause();
+                    currentMediaMeta.status = "paused";
+                    syncTransportControlsOnly();
+                }
+            }
+        }
+
+        function onSeekAudio(val) {
+            const audioEl = document.getElementById("globalHtml5Audio");
+            if (audioEl && currentMediaMeta.previewUrl && !isPrimingSilentAudio) {
+                const target = parseFloat(val);
+                if (!isNaN(target) && isFinite(target)) {
+                    try { audioEl.currentTime = target; } catch (e) {}
+                }
+            }
+        }
+
+        function onVolumeChange(val) {
+            const audioEl = document.getElementById("globalHtml5Audio");
+            if (audioEl) {
+                audioEl.volume = Math.max(0, Math.min(1, parseFloat(val) || 1));
+            }
+        }
+
+        // Bind HTML5 Audio Progress Events
+        (function setupGlobalAudioEvents() {
+            const audioEl = document.getElementById("globalHtml5Audio");
+            if (!audioEl) return;
+
+            audioEl.addEventListener("timeupdate", () => {
+                if (isPrimingSilentAudio) return;
+                const cur = audioEl.currentTime || 0;
+                const dur = (audioEl.duration && isFinite(audioEl.duration)) ? audioEl.duration : 30;
+                document.querySelectorAll('[data-role="cur-time"]').forEach(el => el.textContent = formatSec(cur));
+                document.querySelectorAll('[data-role="dur-time"]').forEach(el => el.textContent = formatSec(dur));
+                document.querySelectorAll('[data-role="seek-slider"]').forEach(sl => {
+                    sl.max = dur;
+                    sl.value = cur;
+                });
+            });
+
+            audioEl.addEventListener("play", () => {
+                if (isPrimingSilentAudio) return;
+                currentMediaMeta.status = "playing-stream";
+                syncTransportControlsOnly();
+            });
+
+            audioEl.addEventListener("pause", () => {
+                if (isPrimingSilentAudio) return;
+                currentMediaMeta.status = "paused";
+                syncTransportControlsOnly();
+            });
+
+            audioEl.addEventListener("ended", () => {
+                if (isPrimingSilentAudio) return;
+                currentMediaMeta.status = "paused";
+                syncTransportControlsOnly();
+            });
+        })();
+
+        // 60FPS Laser & Spectrum Visualizer on Canvas
+        function startCanvasVisualizerLoop() {
+            if (visualizerRaf) cancelAnimationFrame(visualizerRaf);
+            let tick = 0;
+            function draw() {
+                tick += 0.06;
+                const canvases = [
+                    document.getElementById("inlineRaveCanvas"),
+                    document.getElementById("dockRaveCanvas")
+                ].filter(Boolean);
+
+                const audioEl = document.getElementById("globalHtml5Audio");
+                const activePlaying = currentMediaMeta.status === "playing-stream" && audioEl && !audioEl.paused;
+
+                canvases.forEach(canvas => {
+                    const rect = canvas.getBoundingClientRect();
+                    if (rect.width === 0 || rect.height === 0) return;
+                    if (canvas.width !== Math.floor(rect.width) || canvas.height !== Math.floor(rect.height)) {
+                        canvas.width = Math.floor(rect.width);
+                        canvas.height = Math.floor(rect.height);
+                    }
+                    const ctx = canvas.getContext("2d");
+                    const w = canvas.width;
+                    const h = canvas.height;
+                    ctx.clearRect(0, 0, w, h);
+
+                    // Laser beams from top center
+                    const numLasers = 5;
+                    for (let i = 0; i < numLasers; i++) {
+                        const angle = Math.sin(tick * 0.9 + i * 1.1) * (activePlaying ? 0.65 : 0.15);
+                        ctx.beginPath();
+                        ctx.moveTo(w / 2, 0);
+                        ctx.lineTo(w / 2 + Math.tan(angle) * h, h);
+                        ctx.strokeStyle = i % 2 === 0 ? "rgba(0, 245, 212, 0.22)" : "rgba(255, 0, 127, 0.22)";
+                        ctx.lineWidth = activePlaying ? 2.2 : 1;
+                        ctx.stroke();
+                    }
+
+                    // Bottom EQ bars
+                    const bars = 32;
+                    const barW = w / bars;
+                    for (let b = 0; b < bars; b++) {
+                        const energy = activePlaying
+                            ? (Math.sin(tick * 3.2 + b * 0.45) * 0.5 + 0.5) * (Math.cos(tick * 1.9 - b * 0.2) * 0.4 + 0.6)
+                            : 0.08;
+                        const barH = Math.max(4, energy * (h * 0.34));
+                        ctx.fillStyle = b % 2 === 0 ? "rgba(0, 245, 212, 0.42)" : "rgba(255, 0, 127, 0.42)";
+                        ctx.fillRect(b * barW + 1, h - barH, Math.max(2, barW - 3), barH);
+                    }
+                });
+
+                visualizerRaf = requestAnimationFrame(draw);
+            }
+            visualizerRaf = requestAnimationFrame(draw);
+        }
+
+        function playTrackInline(artistId, trackIdx) {
+            const artistIdx = ARTISTS_DATA.findIndex(a => a.id === artistId);
+            if (artistIdx === -1) return;
+            const artist = ARTISTS_DATA[artistIdx];
+            const isLiveSet = trackIdx === "liveset";
+            const key = artistId + "__" + trackIdx;
+
+            if (activeInlineTrackKey === key) {
+                activeInlineTrackKey = null;
+                stopAllPlayback();
+                renderApp();
+                return;
+            }
+
+            // Default to Audio Engine on iPhone or when user clicks "Escuchar Aquí" so sound starts immediately
+            playerEngine = "audio";
+            activeInlineTrackKey = key;
+            expandedArtists.add(artistId);
+
+            dockState.artistIndex = artistIdx;
+            dockState.trackIndex = isLiveSet ? 0 : Number(trackIdx);
+            dockState.isLiveSet = isLiveSet;
+
+            const queryText = isLiveSet
+                ? (artist.name + " Live Set EDC Festival")
+                : artist.tracks[trackIdx].title;
+
+            renderApp();
+            loadAndPlayTrackMedia(queryText, artist.name, artist.stage, isLiveSet ? 0 : Number(trackIdx));
+        }
+
+        function closeInlineVideo() {
+            activeInlineTrackKey = null;
+            stopAllPlayback();
+            renderApp();
+        }
+
+        function openDockPlayer(artistIdx, trackIdx, isLiveSet = false) {
+            const artist = ARTISTS_DATA[artistIdx];
+            if (!artist) return;
+
+            dockState.open = true;
+            dockState.artistIndex = artistIdx;
+            dockState.trackIndex = isLiveSet ? 0 : Number(trackIdx);
+            dockState.isLiveSet = isLiveSet;
+            dockState.minimized = false;
+
+            const queryText = isLiveSet
+                ? (artist.name + " Live Set EDC Festival")
+                : artist.tracks[dockState.trackIndex].title;
+
+            const dockEl = document.getElementById("floatingPlayerDock");
+            if (dockEl) {
+                dockEl.style.display = "flex";
+                dockEl.classList.remove("minimized");
+            }
+
+            document.getElementById("dockArtistStage").textContent = `⚡ #${String(artist.index).padStart(3, "0")} ${artist.name} • ${artist.stage}`;
+            document.getElementById("dockTrackTitle").textContent = queryText;
+            document.getElementById("dockExternalYt").href = getYouTubeLink(queryText);
+            document.getElementById("dockExternalSpotify").href = getSpotifySearchLink(queryText);
+
+            loadAndPlayTrackMedia(queryText, artist.name, artist.stage, dockState.trackIndex);
+        }
+
+        function playAdjacentTrack(dir) {
+            const artist = ARTISTS_DATA[dockState.artistIndex] || ARTISTS_DATA[0];
+            if (!artist) return;
+            let nextTrackIdx = (dockState.trackIndex + dir + artist.tracks.length) % artist.tracks.length;
+            dockState.trackIndex = nextTrackIdx;
+            dockState.isLiveSet = false;
+
+            if (activeInlineTrackKey) {
+                activeInlineTrackKey = artist.id + "__" + nextTrackIdx;
+                renderApp();
+            }
+
+            const queryText = artist.tracks[nextTrackIdx].title;
+            if (dockState.open) {
+                document.getElementById("dockArtistStage").textContent = `⚡ #${String(artist.index).padStart(3, "0")} ${artist.name} • ${artist.stage}`;
+                document.getElementById("dockTrackTitle").textContent = queryText;
+                document.getElementById("dockExternalYt").href = getYouTubeLink(queryText);
+                document.getElementById("dockExternalSpotify").href = getSpotifySearchLink(queryText);
+            }
+
+            loadAndPlayTrackMedia(queryText, artist.name, artist.stage, nextTrackIdx);
+        }
+
+        function toggleTheaterMode() {
+            dockState.theater = !dockState.theater;
+            const dockEl = document.getElementById("floatingPlayerDock");
+            if (dockEl) dockEl.classList.toggle("theater-mode", dockState.theater);
+        }
+
+        function toggleMinimizeDock() {
+            dockState.minimized = !dockState.minimized;
+            const dockEl = document.getElementById("floatingPlayerDock");
+            if (dockEl) dockEl.classList.toggle("minimized", dockState.minimized);
+        }
+
+        function closeDockPlayer() {
+            dockState.open = false;
+            const dockEl = document.getElementById("floatingPlayerDock");
+            if (dockEl) dockEl.style.display = "none";
+            if (!activeInlineTrackKey) stopAllPlayback();
+        }
+
+        function buildAzBar() {
+            const azBar = document.getElementById("azBar");
+            if (!azBar) return;
+            const letters = ["ALL", "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O", "P", "Q", "R", "S", "T", "U", "V", "W", "Y", "Z", "#"];
+            azBar.innerHTML = `<span class="az-label">Índice A–Z:</span>` + letters.map(l => {
+                const activeClass = currentLetter === l ? "active" : "";
+                const label = l === "ALL" ? "Todas" : l;
+                return `<button type="button" class="az-btn ${activeClass}" onclick="setLetter('${l}')">${label}</button>`;
+            }).join("");
+        }
+
+        function setLetter(letter) {
+            currentLetter = letter;
+            buildAzBar();
+            renderApp();
         }
 
         function setCategory(cat) {
             currentCategory = cat;
-            const buttons = document.querySelectorAll("#categoryPills .pill-btn");
-            buttons.forEach(btn => {
-                if (btn.getAttribute("data-cat") === cat) {
-                    btn.classList.add("active");
-                } else {
-                    btn.classList.remove("active");
-                }
+            document.querySelectorAll("#categoryPills .pill-btn").forEach(btn => {
+                btn.classList.toggle("active", btn.getAttribute("data-cat") === cat);
             });
             renderApp();
         }
 
         function onSearchInput(val) {
-            searchQuery = val || "";
+            searchQuery = (val || "").trim();
             const clearBtn = document.getElementById("clearSearchBtn");
-            if (clearBtn) {
-                clearBtn.style.display = searchQuery.trim().length > 0 ? "block" : "none";
-            }
+            if (clearBtn) clearBtn.style.display = searchQuery ? "block" : "none";
             renderApp();
         }
 
         function clearSearch() {
             const input = document.getElementById("searchInput");
             if (input) input.value = "";
-            onSearchInput("");
+            searchQuery = "";
+            const clearBtn = document.getElementById("clearSearchBtn");
+            if (clearBtn) clearBtn.style.display = "none";
+            renderApp();
         }
 
         function resetFilters() {
-            clearSearch();
+            currentCategory = "all";
             currentLetter = "ALL";
-            renderAzBar();
-            setCategory("all");
+            clearSearch();
+            document.querySelectorAll("#categoryPills .pill-btn").forEach(btn => {
+                btn.classList.toggle("active", btn.getAttribute("data-cat") === "all");
+            });
+            buildAzBar();
+            renderApp();
         }
 
-        function toggleArtistTracks(artistId) {
+        function toggleArtistCard(artistId) {
             if (expandedArtists.has(artistId)) {
                 expandedArtists.delete(artistId);
             } else {
                 expandedArtists.add(artistId);
-                // Precarga silenciosa del catálogo del artista en segundo plano al abrir su tarjeta
-                const artistObj = ARTISTS_DATA.find(a => a.id === artistId);
-                if (artistObj && artistObj.tracks[0]) {
-                    fetchRealTrackStream(artistObj.tracks[0].title, artistObj.name, 0).catch(() => {});
-                }
+                const artist = ARTISTS_DATA.find(a => a.id === artistId);
+                if (artist) ensureArtistCatalogPool(artist.name);
             }
             renderApp();
         }
@@ -3249,21 +2862,171 @@
                 savedRoute.add(artistId);
             }
             saveSet("edc2027_full_route", savedRoute);
+            updateCounters();
             renderApp();
         }
 
-        function toggleLike(trackKey) {
+        function toggleLikeTrack(trackKey) {
             if (likedTracks.has(trackKey)) {
                 likedTracks.delete(trackKey);
             } else {
                 likedTracks.add(trackKey);
             }
             saveSet("edc2027_full_likes", likedTracks);
+            updateCounters();
             renderApp();
         }
 
-        function printGuide() {
-            window.print();
+        function updateCounters() {
+            const rBadge = document.getElementById("routeCountBadge");
+            const lBadge = document.getElementById("likedCountBadge");
+            if (rBadge) rBadge.textContent = savedRoute.size;
+            if (lBadge) lBadge.textContent = likedTracks.size;
+        }
+
+        function renderInlineDrawerHtml(artist, trackIdxOrLiveset, queryText) {
+            return `
+                <div class="inline-video-drawer">
+                    <div class="inline-video-header">
+                        <span style="font-weight:800; color:#00f5d4;">⚡ Reproductor Multimedia EDC 2027: ${queryText}</span>
+                        <div style="display:flex; gap:6px;">
+                            <button type="button" class="mini-chip-btn" onclick="openDockPlayer(${artist.index - 1}, ${trackIdxOrLiveset === 'liveset' ? 0 : trackIdxOrLiveset}, ${trackIdxOrLiveset === 'liveset'})">📺 Fijar en Player Flotante</button>
+                            <button type="button" class="mini-chip-btn" style="border-color:#ff007f; color:#ff007f;" onclick="closeInlineVideo()">✕ Cerrar</button>
+                        </div>
+                    </div>
+                    <div class="engine-tabs">
+                        <button type="button" class="engine-tab ${playerEngine === 'video' ? 'active' : ''}" id="inlineTabVideo" onclick="setPlayerEngine('video')">📺 Video Completo YouTube</button>
+                        <button type="button" class="engine-tab ${playerEngine === 'spotify' ? 'active' : ''}" id="inlineTabSpotify" onclick="setPlayerEngine('spotify')">🟢 Spotify Embed</button>
+                        <button type="button" class="engine-tab ${playerEngine === 'audio' ? 'active' : ''}" id="inlineTabAudio" onclick="setPlayerEngine('audio')">🎧 Preview Audio + Láser</button>
+                        <button type="button" class="engine-tab" onclick="openYouTubePopup('${queryText.replace(/'/g, "\\'")}')">🚀 Mini-Ventana YT</button>
+                    </div>
+                    <div id="inlineMediaStage">
+                        ${buildMediaStageHtml("inline")}
+                    </div>
+                </div>
+            `;
+        }
+
+        function renderApp() {
+            const grid = document.getElementById("artistsGrid");
+            const emptyState = document.getElementById("emptyState");
+            const counter = document.getElementById("resultsCounter");
+            if (!grid) return;
+
+            const qLower = searchQuery.toLowerCase();
+
+            const filtered = ARTISTS_DATA.filter(artist => {
+                if (currentLetter !== "ALL" && artist.letter !== currentLetter) return false;
+
+                if (currentCategory === "ruta" && !savedRoute.has(artist.id)) return false;
+                if (currentCategory === "favoritas") {
+                    const hasLiked = artist.tracks.some((_, idx) => likedTracks.has(artist.id + "__" + idx));
+                    if (!hasLiked) return false;
+                } else if (currentCategory !== "all" && currentCategory !== "ruta") {
+                    if (!artist.categories.includes(currentCategory)) return false;
+                }
+
+                if (qLower) {
+                    const matchArtist = artist.name.toLowerCase().includes(qLower) ||
+                                        artist.genre.toLowerCase().includes(qLower) ||
+                                        artist.stage.toLowerCase().includes(qLower);
+                    const matchTrack = artist.tracks.some(t => t.title.toLowerCase().includes(qLower));
+                    if (!matchArtist && !matchTrack) return false;
+                }
+
+                return true;
+            });
+
+            if (counter) {
+                counter.textContent = `Mostrando ${filtered.length} de 152 artistas del cartel oficial (${filtered.length * 10} canciones disponibles)`;
+            }
+
+            if (filtered.length === 0) {
+                grid.innerHTML = "";
+                if (emptyState) emptyState.style.display = "block";
+                return;
+            }
+            if (emptyState) emptyState.style.display = "none";
+
+            grid.innerHTML = filtered.map(artist => {
+                const isSaved = savedRoute.has(artist.id);
+                const isExpanded = expandedArtists.has(artist.id) || Boolean(qLower) || currentCategory === "favoritas";
+                const liveSetKey = artist.id + "__liveset";
+                const isLiveSetOpen = activeInlineTrackKey === liveSetKey;
+                const liveSetQuery = artist.name + " Live Set EDC Festival";
+
+                const tracksHtml = artist.tracks.map((track, idx) => {
+                    const trackKey = artist.id + "__" + idx;
+                    const isLiked = likedTracks.has(trackKey);
+                    const isTrackOpen = activeInlineTrackKey === trackKey;
+                    const isHighlighted = qLower && track.title.toLowerCase().includes(qLower);
+                    const numStr = String(idx + 1).padStart(2, "0");
+
+                    return `
+                        <div class="track-row ${isHighlighted ? 'highlight' : ''}">
+                            <div class="track-left">
+                                <button type="button" class="heart-btn ${isLiked ? 'liked' : ''}" onclick="toggleLikeTrack('${trackKey}')" title="Guardar canción favorita">
+                                    ${isLiked ? "❤️" : "♡"}
+                                </button>
+                                <span class="track-num">${numStr}</span>
+                                <div class="track-info">
+                                    <div class="track-title">${track.title}</div>
+                                    <span class="track-role">${track.role}</span>
+                                </div>
+                            </div>
+                            <div class="track-actions no-print">
+                                <button type="button" class="play-inline-btn ${isTrackOpen ? 'active' : ''}" onclick="playTrackInline('${artist.id}', ${idx})">
+                                    ${isTrackOpen ? "▲ Ocultar Player" : "▶ Escuchar Aquí"}
+                                </button>
+                                <button type="button" class="mini-chip-btn" onclick="openDockPlayer(${artist.index - 1}, ${idx}, false)" title="Enviar al Reproductor Flotante">📺</button>
+                                <a href="${getSpotifySearchLink(track.title)}" target="_blank" rel="noopener noreferrer" class="sp-btn" title="Buscar en Spotify">🟢</a>
+                                <a href="${getYouTubeLink(track.title)}" target="_blank" rel="noopener noreferrer" class="yt-btn" title="Abrir en YouTube">↗ YT</a>
+                            </div>
+                        </div>
+                        ${isTrackOpen ? renderInlineDrawerHtml(artist, idx, track.title) : ""}
+                    `;
+                }).join("");
+
+                return `
+                    <article class="artist-card" data-artist-name="${artist.name.replace(/"/g, '&quot;')}">
+                        <div class="card-accent-bar"></div>
+                        <div class="card-header">
+                            <div class="card-top-row">
+                                <div>
+                                    <span class="number-badge">#${String(artist.index).padStart(3, "0")}</span>
+                                    <span class="stage-badge">${artist.stage}</span>
+                                    <span class="genre-label">${artist.genre}</span>
+                                    <h2 class="artist-name">${artist.name}</h2>
+                                </div>
+                                <button type="button" class="route-btn no-print ${isSaved ? 'saved' : ''}" onclick="toggleRoute('${artist.id}')">
+                                    ${isSaved ? "★ En Mi Ruta" : "+ Mi Ruta"}
+                                </button>
+                            </div>
+                            <p class="artist-vibe">${artist.vibe}</p>
+                            <div class="card-actions-bar no-print">
+                                <button type="button" class="toggle-tracks-btn" onclick="toggleArtistCard('${artist.id}')">
+                                    ${isExpanded ? "▲ Ocultar Top 10 Canciones" : "▼ Ver Top 10 Canciones (10)"}
+                                </button>
+                                <div style="display:flex; gap:6px; flex-wrap:wrap;">
+                                    <button type="button" class="liveset-link" style="cursor:pointer;" onclick="playTrackInline('${artist.id}', 'liveset')">
+                                        ${isLiveSetOpen ? "▲ Cerrar Live Set" : "🎥 Ver Live Set Aquí"}
+                                    </button>
+                                    <a href="${getSpotifySearchLink(artist.name)}" target="_blank" rel="noopener noreferrer" class="sp-btn">🟢 Spotify</a>
+                                    <a href="${getYouTubeLink(liveSetQuery)}" target="_blank" rel="noopener noreferrer" class="yt-btn">↗ Set en YT</a>
+                                </div>
+                            </div>
+                        </div>
+                        ${isLiveSetOpen ? renderInlineDrawerHtml(artist, "liveset", liveSetQuery) : ""}
+                        <div class="tracks-list ${isExpanded ? '' : 'collapsed'}">
+                            ${tracksHtml}
+                        </div>
+                    </article>
+                `;
+            }).join("");
+
+            if (activeInlineTrackKey) {
+                startCanvasVisualizerLoop();
+            }
         }
 
         function openModal() {
@@ -3272,35 +3035,37 @@
             if (!modal || !content) return;
 
             const routeArtists = ARTISTS_DATA.filter(a => savedRoute.has(a.id));
-            const favSongs = [];
-
-            ARTISTS_DATA.forEach(artist => {
-                artist.tracks.forEach((t, i) => {
-                    if (likedTracks.has(artist.id + "__" + i)) {
-                        favSongs.push({
-                            artist: artist.name,
-                            title: t.title,
-                            url: getYouTubeLink(t.title)
-                        });
+            const likedItems = [];
+            ARTISTS_DATA.forEach(a => {
+                a.tracks.forEach((t, idx) => {
+                    if (likedTracks.has(a.id + "__" + idx)) {
+                        likedItems.push({ artist: a.name, stage: a.stage, title: t.title });
                     }
                 });
             });
 
-            let html = `
-                <div>
-                    <h4 style="color:#ffee00; font-size:0.85rem; text-transform:uppercase; margin-bottom:8px;">⭐ Artistas en Mi Ruta (${routeArtists.length} de 152)</h4>
-                    ${routeArtists.length ? routeArtists.map(a => `<span style="display:inline-block; background:#1c1c2e; border:1px solid rgba(255,255,255,0.2); padding:5px 10px; border-radius:8px; font-size:0.8rem; margin:0 6px 6px 0;"><strong>${a.name}</strong> · ${a.stage}</span>`).join("") : `<p style="color:#94a3b8; font-size:0.85rem;">Aún no has agregado artistas con el botón "+ Mi Ruta".</p>`}
-                </div>
-                <div style="border-top:1px solid rgba(255,255,255,0.14); padding-top:14px;">
-                    <h4 style="color:#ff007f; font-size:0.85rem; text-transform:uppercase; margin-bottom:8px;">❤️ Mis Canciones Favoritas (${favSongs.length})</h4>
-                    ${favSongs.length ? favSongs.map(s => `
-                        <div style="display:flex; justify-content:space-between; align-items:center; gap:10px; padding:8px 0; border-bottom:1px solid rgba(255,255,255,0.08);">
-                            <div style="font-size:0.84rem; color:#ffffff;"><strong>${s.title}</strong> <span style="color:#94a3b8;">(${s.artist})</span></div>
-                            <a href="${s.url}" target="_blank" rel="noopener noreferrer" class="yt-btn">▶ YouTube</a>
-                        </div>
-                    `).join("") : `<p style="color:#94a3b8; font-size:0.85rem;">Marca cualquier canción con el corazón ♥ para guardarla aquí.</p>`}
-                </div>
-            `;
+            let html = `<div>
+                <h4 style="color:#ffee00; margin-bottom:8px; font-family:'Orbitron',sans-serif;">⭐ Artistas en Mi Ruta EDC (${routeArtists.length})</h4>`;
+            if (routeArtists.length === 0) {
+                html += `<p style="color:#94a3b8; font-size:0.85rem;">Aún no has agregado artistas. Usa el botón "+ Mi Ruta" en cualquier tarjeta.</p>`;
+            } else {
+                html += `<ul style="list-style:none; display:flex; flex-direction:column; gap:6px;">` +
+                    routeArtists.map(a => `<li style="background:#181828; padding:8px 12px; border-radius:8px; font-size:0.85rem;"><strong>#${String(a.index).padStart(3, "0")} ${a.name}</strong> • <span style="color:#00f5d4;">${a.stage}</span> (${a.genre})</li>`).join("") +
+                    `</ul>`;
+            }
+            html += `</div><div>
+                <h4 style="color:#ff007f; margin-bottom:8px; font-family:'Orbitron',sans-serif;">❤️ Canciones Favoritas (${likedItems.length})</h4>`;
+            if (likedItems.length === 0) {
+                html += `<p style="color:#94a3b8; font-size:0.85rem;">Aún no has marcado canciones con el corazón ♡.</p>`;
+            } else {
+                html += `<ul style="list-style:none; display:flex; flex-direction:column; gap:6px;">` +
+                    likedItems.map(item => `<li style="background:#181828; padding:8px 12px; border-radius:8px; font-size:0.84rem; display:flex; justify-content:space-between; align-items:center; gap:8px;">
+                        <span><strong>${item.title}</strong> <small style="color:#94a3b8;">(${item.stage})</small></span>
+                        <a href="${getYouTubeLink(item.title)}" target="_blank" rel="noopener noreferrer" class="yt-btn">▶ YT</a>
+                    </li>`).join("") +
+                    `</ul>`;
+            }
+            html += `</div>`;
 
             content.innerHTML = html;
             modal.style.display = "flex";
@@ -3312,44 +3077,50 @@
         }
 
         function copyMyList() {
-            const routeArtists = ARTISTS_DATA.filter(a => savedRoute.has(a.id)).map(a => "- " + a.name + " (" + a.stage + ")");
-            const favSongs = [];
-            ARTISTS_DATA.forEach(artist => {
-                artist.tracks.forEach((t, i) => {
-                    if (likedTracks.has(artist.id + "__" + i)) {
-                        favSongs.push("- " + t.title + " (" + getYouTubeLink(t.title) + ")");
+            const routeArtists = ARTISTS_DATA.filter(a => savedRoute.has(a.id));
+            const lines = ["⚡ MI RUTA EDC MÉXICO 2027 ⚡", ""];
+            if (routeArtists.length > 0) {
+                lines.push("ARTISTAS EN MI RUTA:");
+                routeArtists.forEach(a => lines.push(`- ${a.name} (${a.stage} | ${a.genre})`));
+                lines.push("");
+            }
+            lines.push("CANCIONES FAVORITAS:");
+            ARTISTS_DATA.forEach(a => {
+                a.tracks.forEach((t, idx) => {
+                    if (likedTracks.has(a.id + "__" + idx)) {
+                        lines.push(`- ${t.title} (${getYouTubeLink(t.title)})`);
                     }
                 });
             });
 
-            const text = [
-                "⚡ MI RUTA EDC MÉXICO 2027 (152 ARTISTAS) ⚡",
-                "",
-                "⭐ ARTISTAS EN MI RUTA:",
-                ...(routeArtists.length ? routeArtists : ["- Ninguno seleccionado aún"]),
-                "",
-                "❤️ CANCIONES IMPERDIBLES:",
-                ...(favSongs.length ? favSongs : ["- Ninguna seleccionada aún"])
-            ].join("\n");
-
-            const ta = document.createElement("textarea");
-            ta.value = text;
-            document.body.appendChild(ta);
-            ta.select();
-            document.execCommand("copy");
-            document.body.removeChild(ta);
-
-            const btn = document.getElementById("copyListBtn");
-            if (btn) {
-                btn.textContent = "✅ ¡Copiado al Portapapeles!";
-                setTimeout(() => {
-                    btn.textContent = "📋 Copiar Mi Ruta al Portapapeles";
-                }, 2000);
-            }
+            const textArea = document.createElement("textarea");
+            textArea.value = lines.join("\n");
+            document.body.appendChild(textArea);
+            textArea.select();
+            try {
+                document.execCommand("copy");
+                const btn = document.getElementById("copyListBtn");
+                if (btn) {
+                    const orig = btn.textContent;
+                    btn.textContent = "✅ ¡Copiado al Portapapeles!";
+                    setTimeout(() => { btn.textContent = orig; }, 2200);
+                }
+            } catch (e) {}
+            document.body.removeChild(textArea);
         }
 
-        renderAzBar();
-        renderApp();
+        function printGuide() {
+            window.print();
+        }
+
+        // Initialize App on Load
+        document.addEventListener("DOMContentLoaded", () => {
+            buildAzBar();
+            updateCounters();
+            renderApp();
+            // Preload first 3 visible artists so first tap on iPhone is 0ms instant
+            ARTISTS_DATA.slice(0, 3).forEach(a => ensureArtistCatalogPool(a.name));
+        });
     </script>
 </body>
 </html>
